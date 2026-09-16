@@ -290,12 +290,14 @@ fn go_fixture_resolves_a_package_to_its_directory_not_to_one_of_its_files() {
         ("go/geometry/point.go", File),
         ("go/geometry/scale.go", File),
         ("go/main.go", File),
+        ("go/report.go", File),
         ("go/geometry/point.go/Point", Class),
         ("go/geometry/point.go/New", Function),
         ("go/geometry/point.go/Point/Magnitude", Function),
         ("go/geometry/scale.go/Scale", Function),
         ("go/main.go/describe", Function),
         ("go/main.go/main", Function),
+        ("go/report.go/report", Function),
     ]
     .into_iter()
     .map(|(p, k)| (p.to_string(), k))
@@ -316,6 +318,17 @@ fn go_fixture_resolves_a_package_to_its_directory_not_to_one_of_its_files() {
     // the target of every package-level reference in the project.
     assert_edge(&graph, "go/main.go", "go/geometry", Import);
     assert_edge(&graph, "go/main.go/main", "go/geometry", Generic);
+
+    // A single-line `import "x"` is the form no other fixture line covers:
+    // recognising only the `import ( .. )` block would leave this edge Generic.
+    assert_eq!(sites(&graph, "go/report.go", "go/geometry", Import), vec![2]);
+    assert!(
+        !graph.references.iter().any(|r| r.from == id(&graph, "go/report.go")
+            && r.to == id(&graph, "go/geometry")
+            && r.kind == Generic),
+        "the import line must not also read as a plain use"
+    );
+
     assert_edge(&graph, "go/main.go/main", "go/geometry/point.go/New", Call);
     assert_edge(&graph, "go/main.go/main", "go/geometry/scale.go/Scale", Call);
     assert_edge(
