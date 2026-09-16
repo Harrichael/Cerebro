@@ -10,7 +10,11 @@ use crate::source::{ColumnUnit, Pos, SourceFile, Span};
 use crate::symbols::{ParsedSymbol, is_package};
 
 pub fn build(index: &Index, project_root: &Path) -> EntityGraph {
-    let mut docs: Vec<&Document> = index.documents.iter().collect();
+    let mut docs: Vec<&Document> = index
+        .documents
+        .iter()
+        .filter(|d| within_project(&d.relative_path))
+        .collect();
     docs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     docs.dedup_by(|a, b| a.relative_path == b.relative_path);
 
@@ -47,6 +51,17 @@ pub fn build(index: &Index, project_root: &Path) -> EntityGraph {
     };
     entity_graph::test_code::mark(&mut graph, |rel| std::fs::read_to_string(project_root.join(rel)).ok());
     graph
+}
+
+/// An indexer can emit documents from outside the tree it was pointed at:
+/// scip-go includes the generated test mains it left in the Go build cache,
+/// whose relative path climbs out of the project with `..`. They are no part
+/// of the project, and folding them in grows a `../../../..` folder spine
+/// from the root.
+fn within_project(relative_path: &str) -> bool {
+    let mut components = Path::new(relative_path).components().peekable();
+    components.peek().is_some()
+        && components.all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 fn root_name(project_root: &Path) -> String {
