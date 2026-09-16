@@ -30,5 +30,5 @@ crates/scip-producer/tests/fixtures/*/target/
 crates/scip-producer/tests/fixtures/*/node_modules/
 crates/scip-producer/tests/fixtures/*/Cargo.lock
 
-# Generated SCIP index for this repo (scripts/scip-index.sh)
+# Generated SCIP index for this repo (--example index)
 /index.scip

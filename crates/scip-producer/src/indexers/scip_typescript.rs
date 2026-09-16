@@ -45,7 +45,6 @@ impl Indexer for ScipTypescript {
         cmd.args(["--yes", "@sourcegraph/scip-typescript", "index", "--output"]).arg(out);
         cmd
     }
-
 }
 
 fn strip_export(line: &str) -> &str {

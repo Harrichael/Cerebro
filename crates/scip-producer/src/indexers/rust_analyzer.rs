@@ -57,12 +57,23 @@ impl Indexer for RustAnalyzer {
         "rustup component add rust-analyzer"
     }
 
+    /// Indexing Rust is a cargo build, so left alone rust-analyzer writes a
+    /// whole `target/` into the project it was pointed at. The directory is
+    /// stable rather than fresh per run so the build cache survives, which is
+    /// the difference between re-indexing in seconds and doing it cold; an
+    /// inherited `CARGO_TARGET_DIR` still wins, since a caller that set one
+    /// means it.
     fn command(&self, out: &Path) -> Command {
         let mut cmd = Command::new(self.tool());
         cmd.args(["scip", "."]).arg("--output").arg(out);
+        if std::env::var_os("CARGO_TARGET_DIR").is_none() {
+            cmd.env(
+                "CARGO_TARGET_DIR",
+                std::env::temp_dir().join("scip-producer-rust-target"),
+            );
+        }
         cmd
     }
-
 }
 
 fn strip_pub(line: &str) -> &str {

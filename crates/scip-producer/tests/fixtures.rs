@@ -1,7 +1,8 @@
 //! Each fixture under `tests/fixtures/<lang>/` is a tiny project with its
-//! committed `index.scip` (regenerate with `scripts/scip-index.sh`). The
-//! tests pin the full entity set and the cross-file edges a consumer would
-//! rely on, so any change in the mapping rules shows up here.
+//! committed `index.scip`, regenerated with
+//! `cargo run -p scip-producer --example index -- tests/fixtures/<lang>`.
+//! The tests pin the full entity set and the cross-file edges a consumer
+//! would rely on, so any change in the mapping rules shows up here.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
