@@ -35,8 +35,8 @@ path = "src/main.rs"
 entity-graph = { workspace = true }
 coalesce = { workspace = true }
 treesitter-producer = { workspace = true }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 

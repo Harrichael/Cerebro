@@ -1,0 +1,19 @@
+[package]
+name = "graph-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Terminal 2D graph view of an EntityGraph: per-container layout and orthogonal edge routing."
+
+[dependencies]
+entity-graph = { workspace = true }
+coalesce = { workspace = true }
+treesitter-producer = { workspace = true }
+anyhow = { workspace = true }
+ratatui = "0.30"
+unicode-width = "0.2"
+log = "0.4"
+
+[dev-dependencies]
+entity-graph = { workspace = true, features = ["test-support"] }
+coalesce = { workspace = true }
