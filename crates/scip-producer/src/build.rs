@@ -6,8 +6,9 @@ use entity_graph::{Entity, EntityGraph, EntityId, EntityKind, Reference, Referen
 use scip::types::symbol_information::Kind;
 use scip::types::{Document, Index, Occurrence, SymbolRole};
 
+use crate::dialect::{self, Dialect};
 use crate::source::{ColumnUnit, Pos, SourceFile, Span};
-use crate::symbols::{ParsedSymbol, is_package};
+use crate::symbols::ParsedSymbol;
 
 pub fn build(index: &Index, project_root: &Path) -> EntityGraph {
     let mut docs: Vec<&Document> = index
@@ -18,18 +19,25 @@ pub fn build(index: &Index, project_root: &Path) -> EntityGraph {
     docs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     docs.dedup_by(|a, b| a.relative_path == b.relative_path);
 
-    let tool = index.metadata.tool_info.name.as_str();
+    let dialect = dialect::for_tool(&index.metadata.tool_info);
     let sources = docs
         .iter()
         .map(|doc| {
-            let unit = ColumnUnit::resolve(doc.position_encoding.enum_value_or_default(), tool);
+            let unit = ColumnUnit::resolve(
+                doc.position_encoding.enum_value_or_default(),
+                dialect.unspecified_column_unit(),
+            );
             std::fs::read_to_string(project_root.join(&doc.relative_path))
                 .ok()
-                .map(|text| SourceFile::new(text, unit))
+                .map(|text| {
+                    let import_lines = dialect.import_lines(&text);
+                    SourceFile::new(text, unit, import_lines)
+                })
         })
         .collect();
 
     let mut b = Builder {
+        dialect,
         docs,
         sources,
         entities: Vec::new(),
@@ -95,6 +103,7 @@ struct Def<'a> {
 }
 
 struct Builder<'a> {
+    dialect: &'static dyn Dialect,
     docs: Vec<&'a Document>,
     sources: Vec<Option<SourceFile>>,
     entities: Vec<Entity>,
@@ -201,11 +210,8 @@ impl<'a> Builder<'a> {
                     }
                     continue;
                 }
-                if sym.is_rust_impl() {
-                    continue;
-                }
                 let scip_kind = kinds.get(occ.symbol.as_str()).copied().unwrap_or_default();
-                let Some(kind) = sym.entity_kind(scip_kind) else {
+                let Some(kind) = self.dialect.entity_kind(&sym, scip_kind) else {
                     continue;
                 };
                 let Some(name_span) = Span::from_scip(&occ.range) else {
@@ -214,9 +220,24 @@ impl<'a> Builder<'a> {
                 let enclosing = Span::from_scip(&occ.enclosing_range);
                 self.claimed.insert((d, o));
 
-                // A module whose definition is the file itself (rust-analyzer,
-                // scip-typescript) or a bare `package` line (scip-go) is the
-                // File entity; only an inline `mod x { .. }` earns its own.
+                // The next two rules are conventions every indexer we have
+                // met happens to share, not protocol, and so the seam where a
+                // fourth one is likeliest to need a `Dialect` hook.
+                //
+                // A Module whose definition is the file itself, or a bare
+                // package line, is the File entity; only an inline
+                // `mod x { .. }` earns its own. An indexer that omitted
+                // `enclosing_range` for an *inline* namespace would fold that
+                // namespace into the File and register it as a container, so
+                // every other file naming it would be claimed against this
+                // one. That is the day to cut.
+                //
+                // `Kind::Package` is the other: that a package is its
+                // directory is what Go, Java and Python all mean by the word,
+                // not something SCIP says -- the kind is undocumented in the
+                // proto. The descriptor cannot answer it at all, since SCIP's
+                // `Package` suffix is a deprecated alias for `Namespace`
+                // (both proto value 1) and so matches any file module.
                 let is_whole_file = kind == EntityKind::Module
                     && enclosing.is_none_or(|e| e.start == Pos { line: 0, col: 0 });
                 if is_whole_file {
@@ -224,7 +245,7 @@ impl<'a> Builder<'a> {
                     // A package spans every file of its directory, so it *is*
                     // the directory; picking one file would make an arbitrary
                     // sibling the target of every reference to the package.
-                    let referent = if is_package(scip_kind) {
+                    let referent = if scip_kind == Kind::Package {
                         self.entities[file.0].parent.unwrap_or(file)
                     } else {
                         file
@@ -306,13 +327,10 @@ impl<'a> Builder<'a> {
             } = self.defs[i];
             let sym = Rc::clone(&self.defs[i].sym);
 
-            let structural = sym
-                .parent()
+            let structural = self
+                .dialect
+                .parent_symbol(&sym)
                 .and_then(|p| self.same_doc_target(&p, doc))
-                .or_else(|| {
-                    sym.rust_impl_self_type()
-                        .and_then(|p| self.same_doc_target(&p, doc))
-                })
                 .or_else(|| {
                     let enclosing = doc_symbols[doc].get(raw).copied().unwrap_or("");
                     let enclosing = ParsedSymbol::parse(enclosing)?;

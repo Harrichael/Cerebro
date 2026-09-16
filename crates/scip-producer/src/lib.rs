@@ -14,7 +14,9 @@
 //! have to know which tool produces the index for which language.
 
 mod build;
+mod dialect;
 pub mod indexer;
+mod indexers;
 mod source;
 mod symbols;
 

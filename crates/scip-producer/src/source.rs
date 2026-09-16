@@ -60,17 +60,14 @@ pub enum ColumnUnit {
 
 impl ColumnUnit {
     /// Indexers written before `position_encoding` existed leave it
-    /// unspecified; scip-typescript is the notable one and it counts UTF-16
-    /// code units (JavaScript strings), everything else we know of counts bytes.
-    pub fn resolve(encoding: PositionEncoding, tool_name: &str) -> ColumnUnit {
+    /// unspecified. The protocol cannot say what they meant by it, so
+    /// `unspecified` is the answer the indexer's own adapter gives.
+    pub fn resolve(encoding: PositionEncoding, unspecified: ColumnUnit) -> ColumnUnit {
         match encoding {
             PositionEncoding::UTF8CodeUnitOffsetFromLineStart => ColumnUnit::Utf8,
             PositionEncoding::UTF16CodeUnitOffsetFromLineStart => ColumnUnit::Utf16,
             PositionEncoding::UTF32CodeUnitOffsetFromLineStart => ColumnUnit::Utf32,
-            PositionEncoding::UnspecifiedPositionEncoding if tool_name == "scip-typescript" => {
-                ColumnUnit::Utf16
-            }
-            PositionEncoding::UnspecifiedPositionEncoding => ColumnUnit::Utf8,
+            PositionEncoding::UnspecifiedPositionEncoding => unspecified,
         }
     }
 }
@@ -83,10 +80,9 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    pub fn new(text: String, unit: ColumnUnit) -> SourceFile {
+    pub fn new(text: String, unit: ColumnUnit, import_lines: Vec<bool>) -> SourceFile {
         let mut line_starts = vec![0];
         line_starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
-        let import_lines = mark_import_lines(&text);
         SourceFile {
             text,
             line_starts,
@@ -137,51 +133,6 @@ fn advance(line: &str, units: usize, width: impl Fn(char) -> usize) -> usize {
     line.len()
 }
 
-/// No indexer we have met sets the `Import` symbol role, so import edges are
-/// recognised textually: `use`/`import`/`from` statements, plus the lines of
-/// a Go `import ( ... )` block.
-fn mark_import_lines(text: &str) -> Vec<bool> {
-    let mut in_go_block = false;
-    text.lines()
-        .map(|raw| {
-            let line = strip_visibility(raw.trim_start());
-            if in_go_block {
-                if line.starts_with(')') {
-                    in_go_block = false;
-                }
-                return true;
-            }
-            if line.starts_with("import (") {
-                in_go_block = true;
-                return true;
-            }
-            ["use", "import", "from"]
-                .iter()
-                .any(|kw| starts_with_word(line, kw))
-        })
-        .collect()
-}
-
-fn strip_visibility(line: &str) -> &str {
-    for prefix in ["pub", "export"] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let rest = match rest.strip_prefix('(') {
-                Some(after) => after.split_once(')').map(|(_, r)| r).unwrap_or(""),
-                None => rest,
-            };
-            if rest.starts_with(char::is_whitespace) {
-                return rest.trim_start();
-            }
-        }
-    }
-    line
-}
-
-fn starts_with_word(line: &str, word: &str) -> bool {
-    line.strip_prefix(word)
-        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,21 +141,13 @@ mod tests {
     fn utf16_columns_land_after_multibyte_chars() {
         // "🚀" is 4 bytes, 2 UTF-16 units, 1 char.
         let text = "a🚀b\nc".to_string();
-        let utf16 = SourceFile::new(text.clone(), ColumnUnit::Utf16);
+        let utf16 = SourceFile::new(text.clone(), ColumnUnit::Utf16, Vec::new());
         assert_eq!(utf16.byte_offset(Pos { line: 0, col: 3 }), 5);
         assert_eq!(utf16.byte_offset(Pos { line: 1, col: 0 }), 7);
-        let utf32 = SourceFile::new(text.clone(), ColumnUnit::Utf32);
+        let utf32 = SourceFile::new(text.clone(), ColumnUnit::Utf32, Vec::new());
         assert_eq!(utf32.byte_offset(Pos { line: 0, col: 2 }), 5);
-        let utf8 = SourceFile::new(text, ColumnUnit::Utf8);
+        let utf8 = SourceFile::new(text, ColumnUnit::Utf8, Vec::new());
         assert_eq!(utf8.byte_offset(Pos { line: 0, col: 5 }), 5);
         assert_eq!(utf8.byte_offset(Pos { line: 9, col: 0 }), 8);
-    }
-
-    #[test]
-    fn import_lines_cover_rust_ts_and_go_forms() {
-        let text = "pub(crate) use a::b;\nimport { x } from \"./y\";\nimport (\n\t\"fmt\"\n)\nfn used() {}\nlet from_here = 1;\n";
-        let src = SourceFile::new(text.to_string(), ColumnUnit::Utf8);
-        let got: Vec<bool> = (0..7).map(|l| src.is_import_line(l)).collect();
-        assert_eq!(got, [true, true, true, true, true, false, false]);
     }
 }

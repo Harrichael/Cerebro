@@ -364,3 +364,36 @@ fn missing_sources_keep_line_ranges_and_zero_byte_ranges() {
     // Without source text there is nothing to spot a `use` line with.
     assert!(graph.references.iter().all(|r| r.kind != Import));
 }
+
+/// An index from a tool with no adapter still yields the protocol graph: every
+/// entity, Call and TypeRef edges, but no Import edges and no indexer-specific
+/// parenting. Pins what the fallback is, so a dispatch regression or a renamed
+/// tool shows up here instead of as a silently thinner graph.
+#[test]
+fn unknown_indexer_gets_the_protocol_only_graph() {
+    use protobuf::Message;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust");
+    let mut index =
+        scip::types::Index::parse_from_bytes(&std::fs::read(root.join("index.scip")).unwrap())
+            .unwrap();
+    index
+        .metadata
+        .mut_or_insert_default()
+        .tool_info
+        .mut_or_insert_default()
+        .name = "scip-nobody".to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.scip");
+    std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+
+    let graph = scip_producer::graph_from_index(&path, &root).unwrap();
+    check_invariants(&graph, "rust");
+    assert_eq!(graph.entities.len(), 15);
+    // Without rust-analyzer's `impl#` reading a method hangs off its file.
+    assert_parent(&graph, "rust/src/geometry.rs/new", "rust/src/geometry.rs");
+    assert_edge(&graph, "rust/src/main.rs/main", "rust/src/geometry.rs/new", Call);
+    // `use geometry::Point;` is still a reference, just not an Import.
+    assert_edge(&graph, "rust/src/main.rs", "rust/src/geometry.rs/Point", TypeRef);
+    assert!(graph.references.iter().all(|r| r.kind != Import));
+}

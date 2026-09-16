@@ -25,7 +25,7 @@ impl ParsedSymbol {
         Some(ParsedSymbol { symbol, canonical })
     }
 
-    fn descriptors(&self) -> &[Descriptor] {
+    pub(crate) fn descriptors(&self) -> &[Descriptor] {
         &self.symbol.descriptors
     }
 
@@ -43,35 +43,13 @@ impl ParsedSymbol {
         &self.last().name
     }
 
-    /// Whether this symbol denotes a rust-analyzer `impl` block itself
-    /// (`.../impl#[Type][Trait]`), which is never an entity of its own.
-    pub fn is_rust_impl(&self) -> bool {
-        rust_impl_index(self.descriptors()).is_some()
-    }
-
     /// The symbol with the last descriptor removed.
     pub fn parent(&self) -> Option<String> {
         let n = self.descriptors().len();
         (n > 1).then(|| self.with_descriptors(self.descriptors()[..n - 1].to_vec()))
     }
 
-    /// rust-analyzer names methods `ns/impl#[Self][Trait]method().`; the
-    /// entity a method belongs to is `ns/Self#`.
-    pub fn rust_impl_self_type(&self) -> Option<String> {
-        let n = self.descriptors().len();
-        let owner = &self.descriptors()[..n.checked_sub(1)?];
-        let at = rust_impl_index(owner)?;
-        let self_type = owner.get(at + 1)?;
-        let mut descriptors = owner[..at].to_vec();
-        descriptors.push(Descriptor {
-            name: self_type.name.clone(),
-            suffix: Suffix::Type.into(),
-            ..Default::default()
-        });
-        Some(self.with_descriptors(descriptors))
-    }
-
-    fn with_descriptors(&self, descriptors: Vec<Descriptor>) -> String {
+    pub(crate) fn with_descriptors(&self, descriptors: Vec<Descriptor>) -> String {
         format_symbol(Symbol {
             descriptors,
             ..self.symbol.clone()
@@ -100,61 +78,30 @@ impl ParsedSymbol {
     }
 }
 
-/// Whether a symbol denotes a package: a container spanning every file of a
-/// directory rather than one file. Only the indexer's own kind can say so.
-/// The descriptor suffix cannot: SCIP's `Package` suffix is a deprecated
-/// alias for `Namespace` (both proto value 1), so it matches a Rust `mod` or
-/// a TypeScript file module just as readily as a Go package.
-pub fn is_package(kind: Kind) -> bool {
-    kind == Kind::Package
-}
-
-fn rust_impl_index(descriptors: &[Descriptor]) -> Option<usize> {
-    let is_type_param = |d: &Descriptor| d.suffix.enum_value() == Ok(Suffix::TypeParameter);
-    let at = descriptors.iter().rposition(|d| !is_type_param(d))?;
-    let head = &descriptors[at];
-    (head.name == "impl"
-        && head.suffix.enum_value() == Ok(Suffix::Type)
-        && at + 1 < descriptors.len())
-    .then_some(at)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn rust_analyzer_method_symbols_resolve_to_their_type() {
-        let method =
-            ParsedSymbol::parse("rust-analyzer cargo fx 0.1.0 geo/impl#[Point][Display]fmt().")
-                .unwrap();
-        assert_eq!(
-            method.rust_impl_self_type().as_deref(),
-            Some("rust-analyzer cargo fx 0.1.0 geo/Point#")
-        );
-        assert_eq!(
-            method.parent().as_deref(),
-            Some("rust-analyzer cargo fx 0.1.0 geo/impl#[Point][Display]")
-        );
-        assert_eq!(method.last_name(), "fmt");
-        assert!(!method.is_rust_impl());
-
-        let block = ParsedSymbol::parse("rust-analyzer cargo fx 0.1.0 geo/impl#[Point]").unwrap();
-        assert!(block.is_rust_impl());
-
-        let plain = ParsedSymbol::parse(
-            "scip-typescript npm fx 0.1.0 src/`geometry.ts`/Point#magnitude().",
+    fn symbols_parse_to_a_descriptor_parent_and_a_kind() {
+        let method = ParsedSymbol::parse(
+            "scip npm fx 0.1.0 src/`geometry.ts`/Point#magnitude().",
         )
         .unwrap();
-        assert!(plain.rust_impl_self_type().is_none());
         assert_eq!(
-            plain.parent().as_deref(),
-            Some("scip-typescript npm fx 0.1.0 src/`geometry.ts`/Point#")
+            method.parent().as_deref(),
+            Some("scip npm fx 0.1.0 src/`geometry.ts`/Point#")
         );
+        assert_eq!(method.last_name(), "magnitude");
+        // An indexer that never sets `kind` leaves the suffix to carry it.
         assert_eq!(
-            plain.entity_kind(Kind::UnspecifiedKind),
+            method.entity_kind(Kind::UnspecifiedKind),
             Some(EntityKind::Function)
         );
+        assert_eq!(method.entity_kind(Kind::Field), None);
+
+        let top = ParsedSymbol::parse("scip npm fx 0.1.0 src/").unwrap();
+        assert_eq!(top.parent(), None);
         assert!(ParsedSymbol::parse("local 3").is_none());
     }
 }
