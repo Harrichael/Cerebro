@@ -11,5 +11,5 @@ func describe(p geometry.Point) string {
 }
 
 func main() {
-	fmt.Println(describe(geometry.New(3, 4)))
+	fmt.Println(describe(geometry.Scale(geometry.New(3, 4), 2)))
 }

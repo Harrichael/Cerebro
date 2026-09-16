@@ -281,17 +281,19 @@ fn typescript_fixture_uses_utf16_columns_and_suffix_kinds() {
 }
 
 #[test]
-fn go_fixture_treats_package_lines_as_the_file_and_import_blocks_as_imports() {
+fn go_fixture_resolves_a_package_to_its_directory_not_to_one_of_its_files() {
     let (graph, _) = fixture("go");
 
     let expected: HashSet<(String, EntityKind)> = [
         ("go", Folder),
         ("go/geometry", Folder),
         ("go/geometry/point.go", File),
+        ("go/geometry/scale.go", File),
         ("go/main.go", File),
         ("go/geometry/point.go/Point", Class),
         ("go/geometry/point.go/New", Function),
         ("go/geometry/point.go/Point/Magnitude", Function),
+        ("go/geometry/scale.go/Scale", Function),
         ("go/main.go/describe", Function),
         ("go/main.go/main", Function),
     ]
@@ -305,7 +307,17 @@ fn go_fixture_treats_package_lines_as_the_file_and_import_blocks_as_imports() {
         "go/geometry/point.go/Point/Magnitude",
         "go/geometry/point.go/Point",
     );
-    assert_edge(&graph, "go/main.go", "go/geometry/point.go", Import);
+    // `Scale` is declared by scale.go even though `package geometry` names a
+    // container that point.go declares too.
+    assert_parent(&graph, "go/geometry/scale.go/Scale", "go/geometry/scale.go");
+
+    // Importing a package, and qualifying a name with it, both mean the
+    // directory. Naming a file instead would make whichever file sorts first
+    // the target of every package-level reference in the project.
+    assert_edge(&graph, "go/main.go", "go/geometry", Import);
+    assert_edge(&graph, "go/main.go/main", "go/geometry", Generic);
+    assert_edge(&graph, "go/main.go/main", "go/geometry/point.go/New", Call);
+    assert_edge(&graph, "go/main.go/main", "go/geometry/scale.go/Scale", Call);
     assert_edge(
         &graph,
         "go/main.go/describe",
@@ -318,9 +330,14 @@ fn go_fixture_treats_package_lines_as_the_file_and_import_blocks_as_imports() {
         "go/geometry/point.go/Point",
         TypeRef,
     );
-    assert_edge(&graph, "go/main.go/main", "go/geometry/point.go/New", Call);
-    // The qualifier in `geometry.New(...)` points at the package, i.e. its file.
-    assert_edge(&graph, "go/main.go/main", "go/geometry/point.go", Generic);
+
+    // The `package geometry` line of every file after the first used to read
+    // as a use of the package, giving each file an edge to its arbitrarily
+    // chosen sibling.
+    assert!(
+        !graph.references.iter().any(|r| r.from == id(&graph, "go/geometry/scale.go")),
+        "a bare `package` line is a declaration, not a reference"
+    );
 }
 
 #[test]

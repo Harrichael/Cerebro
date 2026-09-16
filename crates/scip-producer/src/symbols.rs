@@ -100,6 +100,15 @@ impl ParsedSymbol {
     }
 }
 
+/// Whether a symbol denotes a package: a container spanning every file of a
+/// directory rather than one file. Only the indexer's own kind can say so.
+/// The descriptor suffix cannot: SCIP's `Package` suffix is a deprecated
+/// alias for `Namespace` (both proto value 1), so it matches a Rust `mod` or
+/// a TypeScript file module just as readily as a Go package.
+pub fn is_package(kind: Kind) -> bool {
+    kind == Kind::Package
+}
+
 fn rust_impl_index(descriptors: &[Descriptor]) -> Option<usize> {
     let is_type_param = |d: &Descriptor| d.suffix.enum_value() == Ok(Suffix::TypeParameter);
     let at = descriptors.iter().rposition(|d| !is_type_param(d))?;

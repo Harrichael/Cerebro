@@ -7,7 +7,7 @@ use scip::types::symbol_information::Kind;
 use scip::types::{Document, Index, Occurrence, SymbolRole};
 
 use crate::source::{ColumnUnit, Pos, SourceFile, Span};
-use crate::symbols::ParsedSymbol;
+use crate::symbols::{ParsedSymbol, is_package};
 
 pub fn build(index: &Index, project_root: &Path) -> EntityGraph {
     let mut docs: Vec<&Document> = index.documents.iter().collect();
@@ -57,8 +57,18 @@ fn root_name(project_root: &Path) -> String {
 }
 
 struct Target {
+    /// The entity that owns what this symbol declares; anything whose
+    /// symbol-parent is this symbol is parented here.
     entity: EntityId,
+    /// Where a use of this symbol points. Only a package differs: it is the
+    /// directory, while the things it declares still belong to whichever
+    /// file spells them.
+    referent: EntityId,
     doc: usize,
+    /// Whether the symbol *is* a file or directory rather than something
+    /// declared inside one. Only the document that first declared it carries
+    /// its `Kind`, so packagehood has to be remembered here.
+    container: bool,
 }
 
 struct Def<'a> {
@@ -78,8 +88,9 @@ struct Builder<'a> {
     by_symbol: HashMap<String, Target>,
     defs: Vec<Def<'a>>,
     defs_by_doc: Vec<Vec<usize>>,
-    /// (doc, occurrence) pairs that became entities; every other
-    /// definition-role occurrence of the same symbol is just a reference.
+    /// (doc, occurrence) pairs that are declarations rather than uses: the
+    /// ones that became entities, plus the repeat declarations of a container
+    /// symbol, which every file it spans restates.
     claimed: HashSet<(usize, usize)>,
 }
 
@@ -165,11 +176,21 @@ impl<'a> Builder<'a> {
                 let Some(sym) = self.parsed(&occ.symbol) else {
                     continue;
                 };
-                if self.by_symbol.contains_key(&sym.canonical) || sym.is_rust_impl() {
+                if let Some(&Target { container, .. }) = self.by_symbol.get(&sym.canonical) {
+                    // A package is declared again by every file in it. Those
+                    // repeats are still declarations, not uses; letting them
+                    // fall through would give each file an edge to whichever
+                    // sibling happened to be indexed first.
+                    if container {
+                        self.claimed.insert((d, o));
+                    }
                     continue;
                 }
-                let kind = kinds.get(occ.symbol.as_str()).copied().unwrap_or_default();
-                let Some(kind) = sym.entity_kind(kind) else {
+                if sym.is_rust_impl() {
+                    continue;
+                }
+                let scip_kind = kinds.get(occ.symbol.as_str()).copied().unwrap_or_default();
+                let Some(kind) = sym.entity_kind(scip_kind) else {
                     continue;
                 };
                 let Some(name_span) = Span::from_scip(&occ.range) else {
@@ -184,11 +205,22 @@ impl<'a> Builder<'a> {
                 let is_whole_file = kind == EntityKind::Module
                     && enclosing.is_none_or(|e| e.start == Pos { line: 0, col: 0 });
                 if is_whole_file {
+                    let file = self.file_of_doc[d];
+                    // A package spans every file of its directory, so it *is*
+                    // the directory; picking one file would make an arbitrary
+                    // sibling the target of every reference to the package.
+                    let referent = if is_package(scip_kind) {
+                        self.entities[file.0].parent.unwrap_or(file)
+                    } else {
+                        file
+                    };
                     self.by_symbol.insert(
                         sym.canonical.clone(),
                         Target {
-                            entity: self.file_of_doc[d],
+                            entity: file,
+                            referent,
                             doc: d,
+                            container: true,
                         },
                     );
                     continue;
@@ -209,8 +241,15 @@ impl<'a> Builder<'a> {
                 // Mirrors the tree-sitter producer: the end is the row holding
                 // the last character, so a one-line entity has an empty range.
                 self.entities[id.0].line_range = span.start.line..span.end.line;
-                self.by_symbol
-                    .insert(sym.canonical.clone(), Target { entity: id, doc: d });
+                self.by_symbol.insert(
+                    sym.canonical.clone(),
+                    Target {
+                        entity: id,
+                        referent: id,
+                        doc: d,
+                        container: false,
+                    },
+                );
                 self.defs_by_doc[d].push(self.defs.len());
                 self.defs.push(Def {
                     entity: id,
@@ -309,7 +348,7 @@ impl<'a> Builder<'a> {
                 let Some(sym) = self.parsed(&occ.symbol) else {
                     continue;
                 };
-                let Some(to) = self.by_symbol.get(&sym.canonical).map(|t| t.entity) else {
+                let Some(to) = self.by_symbol.get(&sym.canonical).map(|t| t.referent) else {
                     continue;
                 };
                 let Some(span) = Span::from_scip(&occ.range) else {
