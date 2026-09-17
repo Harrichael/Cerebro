@@ -103,6 +103,26 @@ impl App {
         app
     }
 
+    /// Where the selection goes when the node holding it stops being a leaf.
+    ///
+    /// Almost always that is because the user just expanded it, and the thing
+    /// they are now looking at is what came out of it -- so the first of its
+    /// children in reading order, not the first node in the diagram. Falling
+    /// back to the diagram's first leaf sent every expand back to the top
+    /// left, which is nowhere near what was expanded.
+    fn inherit_selection(&self) -> Option<EntityId> {
+        let mut leaves: Vec<(EntityId, Rect)> =
+            self.diagram.nodes.iter().filter(|n| !n.is_box).map(|n| (n.id, n.rect)).collect();
+        leaves.sort_by_key(|(_, r)| (r.y, r.x));
+        self.selected
+            .and_then(|was| {
+                leaves.iter().find(|(id, _)| is_under(&self.graph, *id, was)).map(|(id, _)| *id)
+            })
+            // Hidden, scoped away, or filtered out: there is nothing of it
+            // left to inherit, so start over.
+            .or_else(|| leaves.first().map(|(id, _)| *id))
+    }
+
     fn labels(&self) -> Labels<'_> {
         Labels::new(&self.graph)
     }
@@ -125,7 +145,7 @@ impl App {
         let still_a_leaf =
             self.diagram.nodes.iter().any(|n| !n.is_box && Some(n.id) == self.selected);
         if !still_a_leaf {
-            self.selected = self.diagram.nodes.iter().find(|n| !n.is_box).map(|n| n.id);
+            self.selected = self.inherit_selection();
         }
         // After placement, not before: the edges still rank the layout, so
         // turning them off reads the same picture with the lines taken away
@@ -776,6 +796,42 @@ mod tests {
         app.mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::CONTROL, 1, 1));
         app.mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::CONTROL, 1, 1));
         assert_eq!(app.zoom, Zoom::Far);
+    }
+
+    /// Expanding a node is a step *into* it, so the selection has to come out
+    /// the other side inside it. It did not: the node became a box, the
+    /// invariant repair fell back to the diagram's first leaf, and every
+    /// expand threw the user back to the top left.
+    #[test]
+    fn expanding_a_node_selects_something_inside_it() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("left", Folder, Some(0)),
+            ("right", Folder, Some(0)),
+            ("a.rs", File, Some(1)),
+            ("b.rs", File, Some(2)),
+            ("c.rs", File, Some(2)),
+        ];
+        let graph = graph_from_parents(&rows, &[(3, 4, Call)]);
+        let mut app = App::new(graph, Rect::new(0, 0, 80, 24));
+        app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> left, right
+
+        // Pick the *second* folder, so "the first leaf in the diagram" and
+        // "a child of what was expanded" cannot be the same answer.
+        let right = EntityId(2);
+        app.select(right);
+        assert_eq!(app.selected, Some(right));
+
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        let now = app.selected.expect("something is selected");
+        assert!(
+            is_under(&app.graph, now, right),
+            "expanding `right` selected {now:?}, which is not inside it"
+        );
+        assert!(
+            app.diagram.nodes.iter().any(|n| !n.is_box && n.id == now),
+            "the selection is not a drawn leaf"
+        );
     }
 
     /// Zooming is the one relayout where the picture does not change, so what
