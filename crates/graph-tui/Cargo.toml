@@ -6,7 +6,7 @@ license.workspace = true
 description = "Terminal 2D graph view of an EntityGraph: per-container layout and orthogonal edge routing."
 
 [[bin]]
-name = "terraform-graph"
+name = "cerebro"
 path = "src/main.rs"
 
 [dependencies]

@@ -256,7 +256,7 @@ fn main() -> Result<()> {
     }));
 
     let mut terminal = ratatui::try_init().context(
-        "opening the terminal (terraform-graph draws a diagram; it needs a real terminal, \
+        "opening the terminal (cerebro draws a diagram; it needs a real terminal, \
          not a pipe or redirect -- use `--example spike` for text output)",
     )?;
     let size = terminal.size()?;
