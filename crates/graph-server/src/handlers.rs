@@ -189,7 +189,7 @@ impl Server {
     }
 
     /// Watcher thread only. Loads the next generation and swaps it in with
-    /// the current zoom migrated across. On error the live snapshot is
+    /// the current expansion migrated across. On error the live snapshot is
     /// untouched and `/status` reports the failure until the next success.
     pub fn rebuild(&self) -> anyhow::Result<()> {
         self.rebuilding.store(true, Ordering::Relaxed);
@@ -221,7 +221,7 @@ impl Server {
         let map = reload::id_map(&old.graph, new_graph);
         let next = Snapshot::build(old.generation + 1, loaded, &self.root, Some(&map));
 
-        // Held from reading the old leaves through the swap: a zoom served
+        // Held from reading the old leaves through the swap: an expansion served
         // in between would be acknowledged and then silently thrown away.
         let old_cursor = old.cursor.lock().unwrap();
         *next.cursor.lock().unwrap() =
@@ -261,6 +261,9 @@ impl Server {
             }
             p if p.starts_with("/ui/") => ui_module(p),
 
+            // The wire names are the older vocabulary, from before expanding
+            // a node and zooming the drawing were told apart. They are a
+            // contract with a shipped page, so they stay as they are.
             "/coalesced/zoom-in" | "/coalesced/zoom-out" | "/coalesced/reset" | "/watch"
             | "/reload"
                 if method != "POST" =>
@@ -284,7 +287,7 @@ impl Server {
                 let target = check_generation(&snap, query)
                     .and_then(|()| parse_id(query).map_err(|msg| error(400, msg)));
                 match target {
-                    Ok(id) => zoom(&snap, id, path == "/coalesced/zoom-in"),
+                    Ok(id) => expand_or_collapse(&snap, id, path == "/coalesced/zoom-in"),
                     Err(resp) => resp,
                 }
             }
@@ -393,7 +396,7 @@ fn search(snap: &Snapshot, query: Option<&str>) -> Response {
     ok(JSON, serde_json::to_vec(&dto::search_dto(&result, snap.generation)).unwrap())
 }
 
-// Takes the caller's cursor guard rather than locking itself: a zoom or
+// Takes the caller's cursor guard rather than locking itself: an expand or
 // reset that dropped the lock before rendering could answer with some other
 // request's move once requests are served concurrently.
 fn coalesced_response(snap: &Snapshot, cursor: &Cursor) -> Response {
@@ -403,9 +406,9 @@ fn coalesced_response(snap: &Snapshot, cursor: &Cursor) -> Response {
 }
 
 // A no-op move is a 409 rather than a 200 with the unchanged payload so the
-// UI can tell "nothing to expand here" apart from a successful zoom without
+// UI can tell "nothing to expand here" apart from a successful move without
 // diffing leaf sets.
-fn zoom(snap: &Snapshot, id: EntityId, down: bool) -> Response {
+fn expand_or_collapse(snap: &Snapshot, id: EntityId, down: bool) -> Response {
     let mut cursor = snap.cursor.lock().unwrap();
     let moved = if down { cursor.move_down(id, &snap.graph) } else { cursor.move_up(id, &snap.graph) };
     if moved {
@@ -426,7 +429,7 @@ fn zoom(snap: &Snapshot, id: EntityId, down: bool) -> Response {
     }
 }
 
-/// A zoom names an entity by id, and ids are per generation, so a request
+/// An expand names an entity by id, and ids are per generation, so a request
 /// that crossed a rebuild would act on some other entity: the caller must say
 /// which generation it meant.
 fn check_generation(snap: &Snapshot, query: Option<&str>) -> Result<(), Response> {
@@ -687,12 +690,12 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// Walks the full zoom contract against the fixture: root view, a
-    /// successful zoom-in whose payload must equal `ui/fixture.coalesced.json`,
+    /// Walks the full expand contract against the fixture: root view, a
+    /// successful expand whose payload must equal `ui/fixture.coalesced.json`,
     /// then every rejection class (409 no-op, 409 unknown id, 400 bad query,
     /// 404 route, 405 method).
     #[test]
-    fn zoom_sequence_follows_contract() {
+    fn expand_sequence_follows_contract() {
         let s = server();
         let at_root = json!({ "generation": 1, "leaves": [0], "edges": [] });
 
@@ -700,11 +703,11 @@ mod tests {
         assert_eq!(root.status, 200);
         assert_eq!(json(&root), at_root);
 
-        let zoomed = s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
-        assert_eq!(zoomed.status, 200);
+        let expanded = s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
+        assert_eq!(expanded.status, 200);
         let expected: Value =
             serde_json::from_str(include_str!("../ui/fixture.coalesced.json")).unwrap();
-        assert_eq!(json(&zoomed), expected);
+        assert_eq!(json(&expanded), expected);
 
         let again = s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
         assert_eq!(again.status, 409);
@@ -927,7 +930,7 @@ mod tests {
         assert_eq!(node(&graph, "proj/src/gone.rs")["removed"], 3);
         assert_eq!(node(&graph, "proj/src")["status"], "modified");
 
-        // Zoom to the file level: every edge names its member references, and
+        // Expand to the file level: every edge names its member references, and
         // the util.rs -> lib.rs bundle holds an unchanged and an added call.
         s.respond("POST", "/coalesced/zoom-in?id=0&generation=1");
         let src_id = id_of(&graph, "proj/src");
@@ -1030,14 +1033,14 @@ mod tests {
     }
 
     /// The live-update contract across one real rebuild of a tree-sitter
-    /// tree: a zoom into `src` survives an edit that grows `a.rs`, adds
+    /// tree: an expansion of `src` survives an edit that grows `a.rs`, adds
     /// `c.rs` and deletes `b.rs`; `/graph.json` carries the id remap from the
-    /// previous generation; a zoom posted for the old generation is refused;
+    /// previous generation; an expand posted for the old generation is refused;
     /// `/search` sees the new text and stamps the generation; `/status`
     /// reports the shape the UI polls. Then a failing loader leaves the live
     /// generation in place and reports the error until the next success.
     #[test]
-    fn live_rebuild_keeps_zoom_and_remaps_ids() {
+    fn live_rebuild_keeps_the_expansion_and_remaps_ids() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("proj");
         write_tree(&root, &[("src/a.rs", "fn a_one() {}\n"), ("src/b.rs", "fn b_one() {}\n")]);
@@ -1059,9 +1062,9 @@ mod tests {
         let (old_src, old_a, old_b) =
             (id_of(&g1, "proj/src"), id_of(&g1, "proj/src/a.rs"), id_of(&g1, "proj/src/b.rs"));
         assert_eq!(s.respond("POST", &format!("/coalesced/zoom-in?id={}&generation=1", id_of(&g1, "proj"))).status, 200);
-        let zoomed = json(&s.respond("POST", &format!("/coalesced/zoom-in?id={old_src}&generation=1")));
-        assert_eq!(zoomed["generation"], 1);
-        assert_eq!(leaf_set(&zoomed), [old_a, old_b].into_iter().collect());
+        let expanded = json(&s.respond("POST", &format!("/coalesced/zoom-in?id={old_src}&generation=1")));
+        assert_eq!(expanded["generation"], 1);
+        assert_eq!(leaf_set(&expanded), [old_a, old_b].into_iter().collect());
 
         write_tree(&root, &[("src/a.rs", "fn a_one() {}\nfn a_two() {}\n"), ("src/c.rs", "fn c_one() {}\n")]);
         std::fs::remove_file(root.join("src/b.rs")).unwrap();

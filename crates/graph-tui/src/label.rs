@@ -63,9 +63,11 @@ impl<'a> Labels<'a> {
     }
 
     /// A box has one row to spend, so it carries its size beside its name
-    /// rather than under it.
-    pub fn box_label(&self, id: EntityId) -> String {
+    /// rather than under it -- until the zoom level is too coarse to afford
+    /// the width, and the name alone has to do.
+    pub fn head(&self, id: EntityId, with_size: bool) -> String {
         match self.size(id).as_str() {
+            _ if !with_size => self.name(id).to_string(),
             "" => self.name(id).to_string(),
             size => format!("{} · {size}", self.name(id)),
         }
@@ -123,14 +125,15 @@ mod tests {
         assert_eq!(l.detail(EntityId(2)), "function · 10–30", "a range says a function's size");
         assert_eq!(l.detail(EntityId(3)), "file · 10 loc · test");
         // A folder has no range of its own; its size is the sum beneath it.
-        assert_eq!(l.box_label(EntityId(0)), "src · 2,010 loc");
+        assert_eq!(l.head(EntityId(0), true), "src · 2,010 loc");
+        assert_eq!(l.head(EntityId(0), false), "src", "a coarse zoom cannot afford the size");
     }
 
     #[test]
     fn a_folder_with_nothing_measurable_under_it_just_gives_its_name() {
         let graph = graph_from_parents(&[("empty", Folder, None)], &[]);
         let l = Labels::new(&graph);
-        assert_eq!(l.box_label(EntityId(0)), "empty");
+        assert_eq!(l.head(EntityId(0), true), "empty");
         assert_eq!(l.detail(EntityId(0)), "folder");
     }
 }

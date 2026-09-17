@@ -1,5 +1,6 @@
 //! One number set, six levels, so before/after are actually comparable.
 use graph_tui::label::Labels;
+use graph_tui::zoom::Zoom;
 use graph_tui::{placer, render, view};
 use std::time::Instant;
 fn main() -> anyhow::Result<()> {
@@ -7,6 +8,11 @@ fn main() -> anyhow::Result<()> {
         (".", 2), (".", 3), (".", 4),
         ("crates/graph-server", 2), ("crates/graph-server", 3), ("crates/graph-server", 4),
     ];
+    let zoom = match std::env::args().nth(1).as_deref() {
+        Some("mid") => Zoom::Mid,
+        Some("far") => Zoom::Far,
+        _ => Zoom::Close,
+    };
     let (mut tot, mut fail) = (0usize, 0usize);
     for (path, depth) in levels {
         let graph = treesitter_producer::graph_from_path(std::path::Path::new(path))?;
@@ -14,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         for _ in 0..depth { for l in c.coalesced().leaves { c.move_down(l, &graph); } }
         let pic = view::apply(&graph, &c.coalesced(), &Default::default());
         let labels = Labels::new(&graph);
-        let d = placer::place(&labels, &pic, 200);
+        let d = placer::place(&labels, &pic, 200, zoom);
         let t = Instant::now();
         let (buf, s) = render::render(&labels, &d, None);
         let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -35,6 +41,6 @@ fn main() -> anyhow::Result<()> {
             (s.unroutable * 100).checked_div(s.submitted).unwrap_or(0), ms,
             if straight > 0 { ink as f64 / straight as f64 } else { 0.0 });
     }
-    println!("TOTAL: {}/{} drawn, {}% fail", tot - fail, tot, fail * 100 / tot.max(1));
+    println!("TOTAL ({}): {}/{} drawn, {}% fail", zoom.name(), tot - fail, tot, fail * 100 / tot.max(1));
     Ok(())
 }

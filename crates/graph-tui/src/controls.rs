@@ -15,24 +15,26 @@ use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
+    Zoom,
     Tests,
     OnePerPair,
     Edges,
     Hide,
     Scope,
     ShowAll,
-    Reset,
+    CollapseAll,
 }
 
 /// Key, control, label — in the order they are drawn.
 const ROWS: &[(char, Control, &str)] = &[
+    ('z', Control::Zoom, "zoom"),
     ('t', Control::Tests, "tests"),
     ('e', Control::OnePerPair, "one edge/pair"),
     ('r', Control::Edges, "edges"),
     ('x', Control::Hide, "hide node"),
     ('s', Control::Scope, "scope to node"),
     ('a', Control::ShowAll, "show all"),
-    ('0', Control::Reset, "zoom all out"),
+    ('0', Control::CollapseAll, "collapse all"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub enum State {
     Action(bool),
     /// An action that also says how much it would undo. Zero disables it.
     Undo(usize),
+    /// A setting with more than two positions, which says which one it is in.
+    Level(&'static str),
 }
 
 impl State {
@@ -53,6 +57,7 @@ impl State {
             State::Switch(_) => true,
             State::Action(on) => on,
             State::Undo(n) => n > 0,
+            State::Level(_) => true,
         }
     }
 
@@ -62,6 +67,7 @@ impl State {
             State::Switch(false) => "off".into(),
             State::Action(_) => String::new(),
             State::Undo(n) => n.to_string(),
+            State::Level(l) => l.into(),
         }
     }
 }
@@ -93,6 +99,72 @@ impl Panel {
     }
 }
 
+/// A button drawn in a node's own top-right corner, as the browser view draws
+/// them. The glyph is the key that does the same thing from the keyboard, so
+/// there is nothing extra to learn from seeing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAction {
+    Expand,
+    Collapse,
+    Scope,
+    Hide,
+}
+
+impl NodeAction {
+    pub fn glyph(self) -> char {
+        match self {
+            NodeAction::Expand => '+',
+            NodeAction::Collapse => '-',
+            NodeAction::Scope => 's',
+            NodeAction::Hide => '×',
+        }
+    }
+}
+
+/// Which buttons a node offers, left to right. A box can be folded back up
+/// and singled out; a leaf can only be opened, and only if it holds anything.
+pub fn node_actions(is_box: bool, expandable: bool) -> &'static [NodeAction] {
+    use NodeAction::{Collapse, Expand, Hide, Scope};
+    match (is_box, expandable) {
+        (true, _) => &[Scope, Collapse, Hide],
+        (false, true) => &[Expand, Hide],
+        (false, false) => &[Hide],
+    }
+}
+
+/// Where the buttons sit: one cell each at the right of the node's frame,
+/// stopping short of the corner. A framed node carries them on its top
+/// border; an unframed one has only the rule under its name, so they go
+/// there rather than over the name itself.
+///
+/// `None` when the node is too narrow to give them room. A node whose whole
+/// edge is buttons has none left to read as a frame, and its name is the
+/// thing the user came for.
+pub fn node_action_row(rect: Rect, count: usize, bordered: bool) -> Option<(u16, u16)> {
+    let count = count as u16;
+    if rect.height < 2 {
+        return None;
+    }
+    // A frame has a corner to keep clear at the end of the run; a rule has
+    // none, so its buttons sit flush and do not leave a stray cell of rule
+    // hanging past them.
+    let (y, pad) = if bordered { (rect.y, 1) } else { (rect.bottom() - 1, 0) };
+    (rect.width >= count + 2 + 2 * pad).then(|| (rect.right() - pad - count, y))
+}
+
+/// The button at a cell of a node's frame, if any.
+pub fn node_action_at(
+    rect: Rect,
+    actions: &[NodeAction],
+    bordered: bool,
+    col: u16,
+    row: u16,
+) -> Option<NodeAction> {
+    let (x0, y) = node_action_row(rect, actions.len(), bordered)?;
+    (row == y && col >= x0 && col < x0 + actions.len() as u16)
+        .then(|| actions[(col - x0) as usize])
+}
+
 const TITLE: &str = " view ";
 
 /// Draw the panel in the top-right of `area` and report where it went.
@@ -101,8 +173,8 @@ const TITLE: &str = " view ";
 /// caller cannot silently mis-pair a state with the wrong row.
 pub fn draw(buf: &mut Buffer, area: Rect, states: impl Fn(Control) -> State) -> Panel {
     let label_w = ROWS.iter().map(|(_, _, l)| l.len()).max().unwrap_or(0) as u16;
-    // key + space + label + gap + the widest reading a switch has.
-    let inner_w = 2 + label_w + 1 + 3;
+    // key + space + label + gap + the widest reading a control has.
+    let inner_w = 2 + label_w + 1 + 5;
     let (w, h) = (inner_w + 2, ROWS.len() as u16 + 2);
     if area.width < w || area.height < h {
         // No room. Better no panel than one drawn over the diagram in pieces;
@@ -155,7 +227,7 @@ pub fn draw(buf: &mut Buffer, area: Rect, states: impl Fn(Control) -> State) -> 
             row.right() - reads.chars().count() as u16,
             y,
             &reads,
-            if on {
+            if on || matches!(state, State::Level(_)) {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 text_style
@@ -221,6 +293,43 @@ mod tests {
         assert_eq!(p.hit(p.rect.x + 2, y), None, "a dead control fired");
         assert!(p.contains(p.rect.x + 2, y), "the click has to stop at the panel");
         assert!(text(&buf, Rect::new(p.rect.x, y, p.rect.width, 1)).contains("show all"));
+    }
+
+    /// The buttons have to be where they are drawn, and a narrow node has to
+    /// keep its border rather than becoming a row of buttons.
+    #[test]
+    fn a_nodes_buttons_are_where_the_clicks_land() {
+        let rect = Rect::new(10, 4, 20, 4);
+        let acts = node_actions(false, true);
+        assert_eq!(acts.len(), 2, "an expandable leaf offers expand and hide");
+        let (x0, y) = node_action_row(rect, acts.len(), true).expect("room for two buttons");
+        assert_eq!((x0, y), (27, 4), "buttons sit at the right of the top border");
+
+        assert_eq!(node_action_at(rect, acts, true, 27, 4), Some(NodeAction::Expand));
+        assert_eq!(node_action_at(rect, acts, true, 28, 4), Some(NodeAction::Hide));
+        assert_eq!(node_action_at(rect, acts, true, 29, 4), None, "the corner is not a button");
+        assert_eq!(node_action_at(rect, acts, true, 27, 5), None, "only one row carries them");
+
+        // Unframed, the same buttons move to the rule under the name so they
+        // do not eat the last two characters of it.
+        let bare = Rect::new(10, 4, 20, 2);
+        assert_eq!(node_action_row(bare, acts.len(), false), Some((28, 5)));
+        assert_eq!(node_action_at(bare, acts, false, 29, 5), Some(NodeAction::Hide));
+        assert_eq!(node_action_at(bare, acts, false, 29, 4), None, "not over the name");
+        assert_eq!(node_action_at(bare, acts, false, 27, 5), None, "the rule is not a button");
+
+        let narrow = Rect::new(0, 0, 5, 4);
+        assert_eq!(node_action_row(narrow, acts.len(), true), None);
+        assert_eq!(node_action_at(narrow, acts, true, 2, 0), None, "a narrow node kept its frame");
+    }
+
+    /// A leaf that holds nothing cannot be expanded, and offering the button
+    /// anyway would be a control that does nothing.
+    #[test]
+    fn only_what_can_be_done_gets_a_button() {
+        assert_eq!(node_actions(false, false), &[NodeAction::Hide]);
+        assert!(node_actions(true, false).contains(&NodeAction::Collapse));
+        assert!(!node_actions(true, false).contains(&NodeAction::Expand));
     }
 
     /// A terminal too small for the panel gets no panel, not a broken one.

@@ -1,7 +1,7 @@
 //! Drawing a placed diagram onto cells.
 //!
 //! The whole diagram is rendered to its own buffer and the caller blits a
-//! window of it. A zoom level is far taller than a terminal, and re-routing
+//! window of it. A diagram is far taller than a terminal, and re-routing
 //! every edge on each scroll keystroke would be both slow and unstable — an
 //! edge would take a different path depending on where you had scrolled to.
 
@@ -12,8 +12,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::controls::{self, NodeAction};
 use crate::label::Labels;
 use crate::placer::Diagram;
+use crate::zoom::Metrics;
 use crate::router::{Connection, ConnectionsLayout, FlowDirection, LineType};
 
 pub struct Stats {
@@ -61,16 +63,51 @@ fn node_style(kind: EntityKind, selected: bool) -> (Style, Style) {
     }
 }
 
-fn draw_box(buf: &mut Buffer, r: Rect, lines: [&str; 2], is_box: bool, style: (Style, Style)) {
-    if r.width < 2 || r.height < 2 || r.right() > buf.area().width || r.bottom() > buf.area().height
-    {
+/// How a node is drawn, which is the one thing a coarse zoom really changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// A container: heavy frame, its name on the row inside the top.
+    Box,
+    /// A cursor leaf: light rounded frame.
+    Leaf,
+    /// A cursor leaf with no room for a frame: its name, and a rule under it
+    /// so it still reads as one thing -- and so the router has two rows of
+    /// zone to refuse to cross, which one row would not give it.
+    Bare,
+}
+
+fn draw_node(buf: &mut Buffer, r: Rect, lines: [&str; 2], shape: Shape, style: (Style, Style)) {
+    if !on_canvas(r, *buf.area()) {
         return;
     }
+    // Whole rows are painted, not just their characters: under REVERSED a
+    // half-painted row shows the highlight breaking off mid-node.
+    let write_row = |buf: &mut Buffer, y: u16, x0: u16, room: usize, text: &str, st: Style| {
+        let mut chars = text.chars().take(room);
+        for i in 0..room {
+            let c = chars.next().unwrap_or(' ');
+            buf[(x0 + i as u16, y)].set_symbol(&c.to_string()).set_style(st);
+        }
+    };
+
+    if shape == Shape::Bare {
+        write_row(buf, r.y, r.x, r.width as usize, lines[0], style.0);
+        // Not "─": that is the glyph the router draws edges with, and a rule
+        // made of it reads as a line running into the node from both sides.
+        for x in r.x..r.right() {
+            buf[(x, r.bottom() - 1)].set_symbol("▁").set_style(style.1);
+        }
+        return;
+    }
+
     // Boxes are heavy and leaves are round, so a container never reads as a
     // leaf. Routed edges are square-cornered for the same reason.
-    let (tl, tr, bl, br, h, v) =
-        if is_box { ('┏', '┓', '┗', '┛', '━', '┃') } else { ('╭', '╮', '╰', '╯', '─', '│') };
-    let style = (style.0, if is_box { style.0 } else { style.1 });
+    let (tl, tr, bl, br, h, v) = if shape == Shape::Box {
+        ('┏', '┓', '┗', '┛', '━', '┃')
+    } else {
+        ('╭', '╮', '╰', '╯', '─', '│')
+    };
+    let style = (style.0, if shape == Shape::Box { style.0 } else { style.1 });
     for x in r.x..r.right() {
         buf[(x, r.y)].set_symbol(&h.to_string()).set_style(style.0);
         buf[(x, r.bottom() - 1)].set_symbol(&h.to_string()).set_style(style.0);
@@ -82,20 +119,34 @@ fn draw_box(buf: &mut Buffer, r: Rect, lines: [&str; 2], is_box: bool, style: (S
     for (pos, c) in [((r.x, r.y), tl), ((r.right() - 1, r.y), tr), ((r.x, r.bottom() - 1), bl), ((r.right() - 1, r.bottom() - 1), br)] {
         buf[pos].set_symbol(&c.to_string()).set_style(style.0);
     }
-    // Whole rows are painted, not just their characters: under REVERSED a
-    // half-painted row shows the highlight breaking off mid-node.
     let room = r.width.saturating_sub(2) as usize;
     for (row, (text, st)) in lines.iter().zip([style.0, style.1]).enumerate() {
         let y = r.y + 1 + row as u16;
         if text.is_empty() || y + 1 >= r.bottom() {
             continue;
         }
-        let mut chars = text.chars().take(room);
-        for i in 0..room {
-            let c = chars.next().unwrap_or(' ');
-            buf[(r.x + 1 + i as u16, y)].set_symbol(&c.to_string()).set_style(st);
-        }
+        write_row(buf, y, r.x + 1, room, text, st);
     }
+}
+
+/// The buttons in a node's own corner. Drawn after the frame, over it.
+fn draw_actions(buf: &mut Buffer, r: Rect, actions: &[NodeAction], bordered: bool, style: Style) {
+    let Some((x0, y)) = controls::node_action_row(r, actions.len(), bordered) else { return };
+    for (i, a) in actions.iter().enumerate() {
+        buf[(x0 + i as u16, y)].set_symbol(&a.glyph().to_string()).set_style(style);
+    }
+}
+
+/// Is there room on the canvas for this node at all?
+///
+/// Placement lets a child escape its parent when the minimum-width floor
+/// binds -- an honest outcome for a box that cannot hold its contents -- and
+/// a deep enough nesting in a narrow enough terminal walks a node off the
+/// canvas. Everything that paints or hit-tests a node asks this first, or the
+/// parts disagree: the frame silently vanishes while the buttons carry on
+/// being painted, and clicked, out in the margin.
+fn on_canvas(r: Rect, area: Rect) -> bool {
+    r.width >= 2 && r.height >= 2 && r.right() <= area.width && r.bottom() <= area.height
 }
 
 /// Render `d` at full size. The returned buffer's area is the diagram's own
@@ -177,8 +228,9 @@ pub fn render(labels: &Labels, d: &Diagram, selected: Option<EntityId>) -> (Buff
     let unroutable = rt.diagnostics().len();
     rt.render(canvas, &mut buf);
 
+    let m = d.zoom.metrics();
     for n in &d.nodes {
-        paint(labels, &mut buf, n.id, n.rect, n.is_box, selected);
+        paint(labels, &mut buf, n.id, n.rect, n.is_box, selected, &m);
     }
 
     // Only the router was forked; the upstream widget draws arrowheads itself,
@@ -207,11 +259,11 @@ pub fn restyle(
 ) {
     for &id in changed {
         let Some(node) = d.nodes.iter().find(|n| n.id == id) else { continue };
-        paint(labels, buf, id, node.rect, node.is_box, selected);
+        paint(labels, buf, id, node.rect, node.is_box, selected, &d.zoom.metrics());
     }
 }
 
-/// One node, border and text, in whatever state it is in.
+/// One node, frame, text and buttons, in whatever state it is in.
 fn paint(
     labels: &Labels,
     buf: &mut Buffer,
@@ -219,17 +271,31 @@ fn paint(
     rect: Rect,
     is_box: bool,
     selected: Option<EntityId>,
+    m: &Metrics,
 ) {
     let Some(kind) = labels.kind(id) else { return };
+    if !on_canvas(rect, *buf.area()) {
+        return;
+    }
     let style = node_style(kind, Some(id) == selected);
-    // A box has one row to spend, so its size goes beside its name; a leaf has
-    // two and puts what kind of thing it is underneath.
-    let (head, detail) = if is_box {
-        (labels.box_label(id), String::new())
-    } else {
-        (labels.name(id).to_string(), labels.detail(id))
+    let shape = match (is_box, m.bordered) {
+        (true, _) => Shape::Box,
+        (false, true) => Shape::Leaf,
+        (false, false) => Shape::Bare,
     };
-    draw_box(buf, rect, [&head, &detail], is_box, style);
+    // A box has one row to spend, so its size goes beside its name; a leaf has
+    // a second row for what kind of thing it is, until the zoom takes it away.
+    let (head, detail) = if is_box {
+        (labels.head(id, m.box_size), String::new())
+    } else if m.detail {
+        (labels.name(id).to_string(), labels.detail(id))
+    } else {
+        (labels.name(id).to_string(), String::new())
+    };
+    draw_node(buf, rect, [&head, &detail], shape, style);
+    let expandable = labels.graph.get(id).is_some_and(|e| !e.children.is_empty());
+    let actions = controls::node_actions(is_box, expandable);
+    draw_actions(buf, rect, actions, shape != Shape::Bare, style.1);
 }
 
 /// Copy the window of `src` at `offset` into `area` of `dst`.
@@ -266,8 +332,8 @@ mod tests {
     use entity_graph::EntityKind::{File, Folder};
     use entity_graph::test_support::graph_from_parents;
 
-    /// A zoom level is far taller than it is wide, so an edge running the
-    /// length of one is the ordinary case, not an extreme.
+    /// A diagram is far taller than it is wide, so an edge running the length
+    /// of one is the ordinary case, not an extreme.
     ///
     /// Long *diagonal* routes are a different matter and deliberately not
     /// asserted here: upstream prices a turn at the squared distance from both
@@ -289,6 +355,7 @@ mod tests {
             edges: vec![DrawnEdge { from: top, to: bottom }],
             width: 190,
             height: 410,
+            zoom: crate::zoom::Zoom::Close,
         };
         let (_, stats) = render(&Labels::new(&graph), &d, None);
         assert_eq!(stats.submitted, 1);
@@ -314,6 +381,7 @@ mod tests {
             edges: vec![],
             width: 10,
             height: 7,
+            zoom: crate::zoom::Zoom::Close,
         };
         let lit = |buf: &Buffer, r: Rect| {
             (r.y..r.bottom()).flat_map(|y| (r.x..r.right()).map(move |x| (x, y))).any(|p| {
@@ -334,6 +402,38 @@ mod tests {
         restyle(&Labels::new(&graph), &d, &mut buf, &[a, b], Some(b));
         assert!(lit(&buf, d.nodes[1].rect), "the selection did not arrive");
         assert!(!lit(&buf, d.nodes[0].rect), "the node the selection left is still lit");
+    }
+
+    /// The coarsest zoom is the one nothing else covers: leaves lose their
+    /// frame there and become a name over a rule. It is also the only test of
+    /// `Diagram::zoom` being read at all -- with a constant `Close` in its
+    /// place this draws a frame and fails.
+    #[test]
+    fn a_leaf_at_the_coarsest_zoom_is_its_name_over_a_rule() {
+        let graph = graph_from_parents(
+            &[("root", Folder, None), ("name_00.rs", File, Some(0))],
+            &[],
+        );
+        let leaf = EntityId(1);
+        let r = Rect::new(0, 0, 12, 2);
+        let d = Diagram {
+            nodes: vec![Placed { id: leaf, rect: r, is_box: false }],
+            edges: vec![],
+            width: 12,
+            height: 2,
+            zoom: crate::zoom::Zoom::Far,
+        };
+        let (buf, _) = render(&Labels::new(&graph), &d, None);
+        let row = |y: u16| (r.x..r.right()).map(|x| buf[(x, y)].symbol()).collect::<String>();
+
+        // The whole name, starting at the node's own left edge: a frame's
+        // worth of inset here would cut two characters off every leaf.
+        assert_eq!(row(0), "name_00.rs  ", "the name is not where a bare leaf puts it");
+        assert!(row(1).starts_with('▁'), "no rule under the name: {:?}", row(1));
+        assert!(
+            !row(0).contains('╭') && !row(1).contains('╰'),
+            "the coarsest zoom drew a frame it has no room for"
+        );
     }
 
     /// An unroutable edge draws no line, so its arrowhead would be a head with
@@ -361,6 +461,7 @@ mod tests {
             edges: vec![DrawnEdge { from: a, to: b }],
             width: 10,
             height: 9,
+            zoom: crate::zoom::Zoom::Close,
         };
         let (buf, stats) = render(&Labels::new(&graph), &d, None);
         assert_eq!(stats.submitted, 1);

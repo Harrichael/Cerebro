@@ -2,8 +2,8 @@
 //!
 //! The seed of the diagram model. It holds the rules that change *which* nodes
 //! and edges exist — not how they are laid out (`placer`) or drawn (`render`).
-//! Today that is the test filter and edge collapse, which is all a single zoom
-//! level needs; hiding, scoping and bundling join them here as they arrive.
+//! Today that is the test filter, edge collapse, hiding and scoping; bundling
+//! joins them here when it arrives.
 //!
 //! [`Picture`] deliberately is not `coalesce::Coalesced`, near-identical as it
 //! looks today. A bundled edge ends on a *box*, which is not a cursor leaf, so
@@ -87,7 +87,7 @@ fn lineage_has(graph: &EntityGraph, id: EntityId, wanted: impl Fn(EntityId) -> b
     false
 }
 
-/// Narrow a zoom level to what should actually be drawn.
+/// Narrow one expansion of the graph to what should actually be drawn.
 pub fn apply(graph: &EntityGraph, coalesced: &Coalesced, settings: &Settings) -> Picture {
     // Hiding and scoping are asked of an *ancestor*, but the cursor hands back
     // leaves, so both questions are answered by walking up from each leaf.
@@ -139,7 +139,7 @@ mod tests {
     use entity_graph::ReferenceKind::{Call, Import};
     use entity_graph::test_support::graph_from_parents;
 
-    fn zoomed(graph: &EntityGraph) -> Coalesced {
+    fn expanded(graph: &EntityGraph) -> Coalesced {
         let mut cursor = coalesce::Cursor::new(graph);
         loop {
             let mut moved = false;
@@ -159,10 +159,10 @@ mod tests {
             &[(1, 2, Import), (1, 2, Call)],
         );
         let every =
-            apply(&graph, &zoomed(&graph), &Settings { one_per_pair: false, ..Default::default() });
+            apply(&graph, &expanded(&graph), &Settings { one_per_pair: false, ..Default::default() });
         assert_eq!(every.edges.len(), 2);
 
-        let collapsed = apply(&graph, &zoomed(&graph), &Settings::default());
+        let collapsed = apply(&graph, &expanded(&graph), &Settings::default());
         assert_eq!(collapsed.edges.len(), 1);
         assert_eq!(collapsed.edges[0].kind, Call, "a call outranks the import that enabled it");
         assert_eq!(collapsed.edges[0].refs.len(), 2, "both references are kept on the one edge");
@@ -187,12 +187,12 @@ mod tests {
         let (src, lib, docs) = (EntityId(1), EntityId(2), EntityId(4));
         let named = |p: &Picture| p.nodes.clone();
 
-        let all = apply(&graph, &zoomed(&graph), &Settings::default());
+        let all = apply(&graph, &expanded(&graph), &Settings::default());
         assert!(named(&all).contains(&lib) && named(&all).contains(&docs));
 
         let hidden = apply(
             &graph,
-            &zoomed(&graph),
+            &expanded(&graph),
             &Settings { hidden: [src].into_iter().collect(), ..Default::default() },
         );
         assert!(!named(&hidden).contains(&lib), "hiding a folder left its file behind");
@@ -200,7 +200,7 @@ mod tests {
         assert!(hidden.edges.is_empty(), "an edge survived the node it came from");
 
         let scoped =
-            apply(&graph, &zoomed(&graph), &Settings { scope: Some(src), ..Default::default() });
+            apply(&graph, &expanded(&graph), &Settings { scope: Some(src), ..Default::default() });
         assert_eq!(named(&scoped), vec![lib], "scoping should keep only what is under it");
     }
 
@@ -214,12 +214,12 @@ mod tests {
         );
         graph.entities[2].is_test = true;
 
-        let shown = apply(&graph, &zoomed(&graph), &Settings::default());
+        let shown = apply(&graph, &expanded(&graph), &Settings::default());
         assert_eq!(shown.nodes.len(), 2);
         assert_eq!(shown.edges.len(), 1);
 
         let hidden =
-            apply(&graph, &zoomed(&graph), &Settings { show_tests: false, ..Default::default() });
+            apply(&graph, &expanded(&graph), &Settings { show_tests: false, ..Default::default() });
         assert_eq!(hidden.nodes.len(), 1);
         assert!(hidden.edges.is_empty(), "an edge survived the node it came from");
     }

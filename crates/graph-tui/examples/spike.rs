@@ -1,11 +1,12 @@
-//! Headless render of one zoom level, so the diagram can be judged from a
+//! Headless render of one expansion, so the diagram can be judged from a
 //! transcript and diffed between changes. The binary needs a terminal; this
 //! does not.
 //!
-//!   cargo run -p graph-tui --example spike -- <path> [depth] [width]
+//!   cargo run -p graph-tui --example spike -- <path> [depth] [width] [close|mid|far]
 
 use graph_tui::view::Settings;
 use graph_tui::label::Labels;
+use graph_tui::zoom::Zoom;
 use graph_tui::{placer, render, view};
 
 fn main() -> anyhow::Result<()> {
@@ -13,6 +14,11 @@ fn main() -> anyhow::Result<()> {
     let root = args.next().unwrap_or_else(|| ".".into());
     let depth: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(2);
     let width: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let zoom = match args.next().as_deref() {
+        Some("mid") => Zoom::Mid,
+        Some("far") => Zoom::Far,
+        _ => Zoom::Close,
+    };
 
     let graph = treesitter_producer::graph_from_path(std::path::Path::new(&root))?;
     let mut cursor = coalesce::Cursor::new(&graph);
@@ -25,7 +31,7 @@ fn main() -> anyhow::Result<()> {
     let settings = Settings::default();
     let picture = view::apply(&graph, &cursor.coalesced(), &settings);
     let labels = Labels::new(&graph);
-    let diagram = placer::place(&labels, &picture, width);
+    let diagram = placer::place(&labels, &picture, width, zoom);
     let (buf, stats) = render::render(&labels, &diagram, None);
 
     for y in 0..buf.area().height {

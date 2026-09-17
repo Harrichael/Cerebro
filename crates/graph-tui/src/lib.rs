@@ -7,3 +7,4 @@ pub mod placer;
 pub mod render;
 pub mod router;
 pub mod view;
+pub mod zoom;

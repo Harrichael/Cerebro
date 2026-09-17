@@ -21,7 +21,7 @@ pub struct CursorReference {
     pub to_leaf: EntityId,
 }
 
-/// One reference edge as seen at the current zoom level.
+/// One reference edge as seen at the current expansion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoalescedEdge {
     pub from: EntityId,
@@ -194,7 +194,7 @@ impl Cursor {
         &self.leaves
     }
 
-    /// The view at the current zoom: every active leaf, plus every reference
+    /// The view at the current expansion: every active leaf, plus every reference
     /// projected onto the leaves that contain its endpoints.
     ///
     /// References whose endpoints fall under the same leaf collapse into
@@ -205,12 +205,12 @@ impl Cursor {
     /// `move_up`.
     ///
     /// Gotcha: a reference whose endpoint *is* an expanded entity (e.g. a
-    /// file-level import once that file is zoomed into) has no child to land
+    /// file-level import once that file is expanded) has no child to land
     /// on, so its leaf pointer stays on the now-inactive entity. Such an edge
     /// can name an endpoint that is not in `leaves`.
     pub fn coalesced(&self) -> Coalesced {
         // A reference whose endpoint *is* an expanded entity (a file-level
-        // import after zooming into that file) has no leaf to live on: the
+        // import after expanding that file) has no leaf to live on: the
         // lineage ends at the old leaf, so split_references_down leaves it
         // pointing at an inactive entity. Such edges are not drawable and are
         // dropped here so `edges` is always within `leaves x leaves`.

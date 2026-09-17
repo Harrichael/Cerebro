@@ -104,7 +104,7 @@ fn ids(ids: &[usize]) -> Vec<EntityId> {
     ids.iter().copied().map(EntityId).collect()
 }
 
-/// The coalesced view through a full zoom sequence over a folder with two
+/// The coalesced view through a full expand sequence over a folder with two
 /// files of two functions each:
 ///
 /// ```text
@@ -116,10 +116,10 @@ fn ids(ids: &[usize]) -> Vec<EntityId> {
 /// vanishes, two calls a→b fold into one edge that keeps both references in
 /// `refs`, and the Call and Import between the same files both survive
 /// because kind is part of the edge identity.
-/// Zooming into one file yields mixed-depth edges; zooming into both restores
+/// Expanding one file yields mixed-depth edges; expanding both restores
 /// the raw references.
 #[test]
-fn test_coalesced_through_zoom_levels() {
+fn test_coalesced_through_expansions() {
     let graph = graph_from_parents(
         &[
             ("root", Folder, None),
@@ -186,7 +186,7 @@ fn test_coalesced_through_zoom_levels() {
     );
 }
 
-/// A file-level import has nowhere to go once the file itself is zoomed
+/// A file-level import has nowhere to go once the file itself is expanded
 /// into: its endpoint is no longer a leaf and no child contains it. The
 /// coalesced view must not emit edges to entities that are not leaves.
 #[test]
@@ -211,7 +211,7 @@ fn test_coalesced_drops_edges_to_expanded_endpoints() {
         }
     );
 
-    // Zoom into a.rs: the Call re-homes to fn_a, the Import's source is now
+    // Expand a.rs: the Call re-homes to fn_a, the Import's source is now
     // the inactive a.rs and must disappear rather than dangle.
     assert!(cursor.move_down(EntityId(1), &graph));
     assert_eq!(

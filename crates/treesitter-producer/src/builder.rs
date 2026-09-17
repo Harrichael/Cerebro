@@ -152,9 +152,9 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
     // node (a glue mod.rs File or one of its declaration-only Module stubs)
     // are dropped entirely.  These are structural plumbing edges (pub mod,
     // pub use re-exports) that, if kept, remap to the parent Folder entity
-    // and leave stale cursor leaf pointers after the user zooms in on that
+    // and leave stale cursor leaf pointers after the user expands that
     // folder — which causes the folder node to reappear in the view tree
-    // even though it has been zoomed past.
+    // even though it has been expanded past.
     // ------------------------------------------------------------------
     let mut index: HashMap<(EntityId, EntityId, GraphReferenceKind), usize> = HashMap::new();
     let mut references: Vec<GraphReference> = Vec::new();
@@ -457,7 +457,7 @@ mod tests {
 
     /// References originating from a glue `mod.rs` (e.g. `pub use mod_impl::render;`)
     /// must be dropped from the entity graph so they do not produce stale cursor
-    /// leaf pointers that cause the parent folder to reappear after zoom-in.
+    /// leaf pointers that cause the parent folder to reappear after an expand.
     #[test]
     fn test_glue_mod_rs_references_dropped() {
         let mut tree = CodeTree::new();
@@ -486,7 +486,7 @@ mod tests {
     }
 
     /// References whose raw `to` endpoint is a glue stub Module node must be
-    /// dropped, preventing the parent folder from appearing after zoom-in.
+    /// dropped, preventing the parent folder from appearing after an expand.
     #[test]
     fn test_references_to_glue_stub_dropped() {
         let mut tree = CodeTree::new();

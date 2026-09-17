@@ -51,6 +51,29 @@ impl Camera {
         self.clamp();
     }
 
+    /// Adopt the *same* picture at a different size, holding one point of it
+    /// still under one cell of the screen.
+    ///
+    /// This is what zooming needs and [`Camera::fit`] cannot give it. `fit`
+    /// opens a differently-sized diagram centred, on the reasoning that a
+    /// different size means a different picture -- which is true of expanding
+    /// a node and false of zooming, the one case where the size changes and
+    /// the picture does not. Going through `fit` sends a reader at the bottom
+    /// of a long diagram back to the top on every press.
+    pub fn rescale(&mut self, extent: (u16, u16), screen: (u16, u16), point: (u16, u16)) {
+        let scale = |v: u16, from: u16, to: u16| match from {
+            0 => 0,
+            from => (i64::from(v) * i64::from(to) / i64::from(from)) as i32,
+        };
+        let (px, py) = (scale(point.0, self.extent.0, extent.0), scale(point.1, self.extent.1, extent.1));
+        self.extent = extent;
+        self.offset = (
+            px - i32::from(screen.0.saturating_sub(self.viewport.x)),
+            py - i32::from(screen.1.saturating_sub(self.viewport.y)),
+        );
+        self.clamp();
+    }
+
     /// Adopt a freshly laid-out diagram. A picture of a different size is a
     /// different picture and opens centred; one that came back the same size
     /// keeps the user where they were, so turning a switch on and off does
@@ -196,6 +219,25 @@ mod tests {
         let mut small = cam((40, 10));
         small.bottom();
         assert_eq!(small.offset, (-20, -7));
+    }
+
+    /// Zooming is the one relayout where the picture is the same picture, so
+    /// what you were reading has to stay where you were reading it.
+    #[test]
+    fn rescaling_holds_a_point_of_the_diagram_under_the_same_cell() {
+        let mut c = cam((200, 400));
+        c.scroll(0, 300);
+        let screen = (40, 12);
+        let point = c.at(screen.0, screen.1).expect("pointing at the diagram");
+        assert!(point.1 > 300, "the test is about being a long way down");
+
+        // Half the height, as a coarser zoom level would give.
+        c.rescale((200, 200), screen, point);
+        let now = c.at(screen.0, screen.1).expect("still on the diagram");
+        assert!(
+            now.1.abs_diff(point.1 / 2) <= 1,
+            "the cell under the pointer moved: {now:?} against {point:?} halved"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! One generation of everything the server derives from a load, and how one
 //! generation carries over to the next. Ids are arena indices, so a rebuild
 //! renumbers everything; `id_map` matches entities across adjacent generations
-//! on `(kind, path)` and `migrate_cursor` re-applies a zoom through that map.
+//! on `(kind, path)` and `migrate_cursor` re-applies an expansion through that map.
 //! See `ui/CONTRACT.md`, "Live updates".
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -170,7 +170,7 @@ pub fn id_map(old: &EntityGraph, new: &EntityGraph) -> Vec<Option<EntityId>> {
         .collect()
 }
 
-/// A new-generation cursor with the old zoom re-applied. Each old leaf lands
+/// A new-generation cursor with the old expansion re-applied. Each old leaf lands
 /// on its match or, when it is gone, its nearest matched ancestor; the strict
 /// ancestors of every target are expanded root-first. A deleted leaf thus
 /// coarsens to its surviving parent while its former siblings stay as they
@@ -243,7 +243,7 @@ mod tests {
     /// Old tree: proj/src/{a.rs, b.rs::{f, g, g}}; new tree drops `a.rs`, adds
     /// `c.rs` and keeps one `g`, all under fresh ids in a different order.
     /// The duplicate `g`s match by ordinal (the second one unmatched), the
-    /// zoom `{a.rs, f, g, g}` survives with `a.rs` coarsened to `src` — so the
+    /// expansion `{a.rs, f, g, g}` survives with `a.rs` coarsened to `src` — so the
     /// new leaves are `src`'s files plus `f` and `g` inside `b.rs`.
     #[test]
     fn id_map_and_cursor_migration() {
@@ -277,7 +277,7 @@ mod tests {
         let migrated = migrate_cursor(&old, &[EntityId(2), EntityId(3)], &map, &new);
         assert_eq!(leaves(&migrated), HashSet::from([EntityId(2), EntityId(3)]));
 
-        // A root-only zoom stays a root-only zoom.
+        // A root-only expansion stays a root-only expansion.
         assert_eq!(leaves(&migrate_cursor(&old, &[EntityId(0)], &map, &new)), HashSet::from([EntityId(0)]));
     }
 

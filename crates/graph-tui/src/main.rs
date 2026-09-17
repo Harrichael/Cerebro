@@ -2,8 +2,8 @@
 //!
 //! The diagram is rendered once per change to a buffer its own size and the
 //! visible window blitted from it, so scrolling never re-routes an edge.
-//! Height is the axis that grows with zoom — width wraps against the viewport
-//! — which is why panning is vertical first.
+//! Height is the axis that grows as the graph is expanded — width wraps
+//! against the viewport — which is why panning is vertical first.
 
 use anyhow::{Context, Result};
 use entity_graph::{EntityGraph, EntityId};
@@ -19,14 +19,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use graph_tui::camera::Camera;
-use graph_tui::controls::{self, Control, State};
+use graph_tui::controls::{self, Control, NodeAction, State};
 use graph_tui::label::Labels;
 use graph_tui::placer::{self, Diagram};
 use graph_tui::render::{self, Stats};
 use graph_tui::view::{self, Settings};
+use graph_tui::zoom::Zoom;
 
 const HINT: &str =
-    "? keys  ·  scroll pans, ⇧scroll sideways, ctrl-scroll zooms  ·  click selects  ·  q quit";
+    "? keys  ·  scroll pans, ⇧scroll sideways, ctrl-scroll zooms  ·  ↵ expand  ·  ⌫ collapse  ·  q quit";
 
 /// Wheel notches are small and terminals are large, so one notch moves more
 /// than one cell. Sideways moves further because columns are narrower than
@@ -42,12 +43,12 @@ const KEYS: &[(&str, &str)] = &[
     ("PgUp PgDn  /  space", "scroll a half screen"),
     ("Home End  /  g G", "back to the start, or the bottom"),
     ("tab ⇧tab  /  n p", "select the next or previous node"),
-    ("click", "select a node"),
+    ("click", "select a node, or press a button on its frame"),
     ("scroll  ⇧scroll", "pan up and down, or left and right"),
-    ("ctrl-scroll", "zoom in and out of the node under the pointer"),
     ("c", "centre the diagram (same as Home)"),
-    ("↵  /  +", "zoom into the selected node"),
-    ("⌫  /  -", "zoom back out"),
+    ("↵  /  +", "expand the selected node into its children"),
+    ("⌫  /  -", "collapse it back into its parent"),
+    ("ctrl-scroll  /  z", "zoom: draw the same graph larger or smaller"),
     ("?", "this list"),
     ("q  /  esc  /  ctrl-c", "quit"),
 ];
@@ -56,6 +57,9 @@ struct App {
     graph: EntityGraph,
     cursor: coalesce::Cursor,
     settings: Settings,
+    /// How large the same graph is drawn, which is a different question from
+    /// how much of the graph is expanded.
+    zoom: Zoom,
     diagram: Diagram,
     canvas: Buffer,
     stats: Stats,
@@ -78,7 +82,14 @@ impl App {
             graph,
             cursor,
             settings: Settings::default(),
-            diagram: Diagram { nodes: Vec::new(), edges: Vec::new(), width: 0, height: 0 },
+            zoom: Zoom::Close,
+            diagram: Diagram {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                width: 0,
+                height: 0,
+                zoom: Zoom::Close,
+            },
             canvas: Buffer::empty(Rect::new(0, 0, 1, 1)),
             stats: Stats { submitted: 0, unroutable: 0 },
             camera: Camera::new(viewport, (0, 0)),
@@ -97,9 +108,17 @@ impl App {
     }
 
     fn rebuild(&mut self) {
+        self.rebuild_holding(None);
+    }
+
+    /// `hold` is a screen cell and the diagram cell under it. Passing one says
+    /// the picture is unchanged and only its size differs -- which is true of
+    /// zooming and of nothing else here.
+    fn rebuild_holding(&mut self, hold: Option<((u16, u16), (u16, u16))>) {
         let picture = view::apply(&self.graph, &self.cursor.coalesced(), &self.settings);
-        self.diagram = placer::place(&self.labels(), &picture, self.camera.viewport.width.max(20));
-        // Only a leaf can be selected: zooming acts on cursor leaves, and a
+        self.diagram =
+            placer::place(&self.labels(), &picture, self.camera.viewport.width.max(20), self.zoom);
+        // Only a leaf can be selected: expanding acts on cursor leaves, and a
         // box is an ancestor of one. Keeping a selection that has become a box
         // leaves every later `step_selection` unable to find its own starting
         // point, so tab silently returns to the first leaf each press.
@@ -121,9 +140,14 @@ impl App {
         // was looking at is a better anchor than the coordinate they were at:
         // widening the terminal by one column re-lays-out the whole diagram,
         // and snapping back to the top on every column of a drag is unusable.
-        self.camera.fit(self.diagram.extent());
-        if let Some(rect) = self.selected.and_then(|id| self.diagram.rect_of(id)) {
-            self.camera.reveal(rect);
+        match hold {
+            Some((screen, point)) => self.camera.rescale(self.diagram.extent(), screen, point),
+            None => {
+                self.camera.fit(self.diagram.extent());
+                if let Some(rect) = self.selected.and_then(|id| self.diagram.rect_of(id)) {
+                    self.camera.reveal(rect);
+                }
+            }
         }
     }
 
@@ -171,6 +195,7 @@ impl App {
     /// them so a control cannot say "on" and do nothing.
     fn state(&self, c: Control) -> State {
         match c {
+            Control::Zoom => State::Level(self.zoom.name()),
             Control::Tests => State::Switch(self.settings.show_tests),
             Control::OnePerPair => State::Switch(self.settings.one_per_pair),
             Control::Edges => State::Switch(self.show_edges),
@@ -178,14 +203,26 @@ impl App {
             Control::ShowAll => {
                 State::Undo(self.settings.hidden.len() + usize::from(self.settings.scope.is_some()))
             }
-            Control::Reset => State::Action(self.cursor.active().iter().any(|&l| {
-                self.graph.get(l).is_some_and(|e| e.parent.is_some())
-            })),
+            Control::CollapseAll => State::Action(
+                self.cursor
+                    .active()
+                    .iter()
+                    .any(|&l| self.graph.get(l).is_some_and(|e| e.parent.is_some())),
+            ),
         }
     }
 
     fn control(&mut self, c: Control) {
         match c {
+            // Cycling is its own path: it holds the middle of the screen, and
+            // the shared `rebuild` at the end of this function would re-centre.
+            Control::Zoom => {
+                let screen = self.viewport_middle();
+                let hold = self.camera.at(screen.0, screen.1).map(|p| (screen, p));
+                self.zoom = self.zoom.cycle();
+                self.rebuild_holding(hold);
+                return;
+            }
             Control::Tests => self.settings.show_tests = !self.settings.show_tests,
             Control::OnePerPair => self.settings.one_per_pair = !self.settings.one_per_pair,
             Control::Edges => self.show_edges = !self.show_edges,
@@ -208,7 +245,7 @@ impl App {
             // Up one level at a time until nothing moves: the cursor has no
             // "all the way out", and a leaf whose parent is already a leaf
             // has to be left where it is rather than skipped.
-            Control::Reset => {
+            Control::CollapseAll => {
                 while self
                     .cursor
                     .active()
@@ -223,36 +260,75 @@ impl App {
         self.rebuild();
     }
 
-    fn zoom(&mut self, in_: bool) {
+    /// Swap the selected node for its children: what is *in* the picture
+    /// changes. Not to be confused with zooming, which changes how big the
+    /// same picture is drawn.
+    fn expand(&mut self) {
+        let Some(id) = self.selected else { return };
+        if self.cursor.move_down(id, &self.graph) {
+            self.rebuild();
+        }
+    }
+
+    /// Fold the selected node back into its parent.
+    fn collapse(&mut self) {
         let Some(id) = self.selected else {
             // Nothing is drawn -- every node at this level was filtered out.
-            // Zooming the whole cursor back up is the only way out that does
-            // not require guessing which setting the user wants changed.
-            if !in_ {
-                let leaves = self.cursor.active().to_vec();
-                let mut moved = false;
-                for leaf in leaves {
-                    moved |= self.cursor.move_up(leaf, &self.graph);
-                }
-                if moved {
-                    self.rebuild();
-                }
+            // Collapsing the whole cursor is the only way out that does not
+            // require guessing which setting the user wants changed.
+            let leaves = self.cursor.active().to_vec();
+            if leaves.into_iter().filter(|&l| self.cursor.move_up(l, &self.graph)).count() > 0 {
+                self.rebuild();
             }
             return;
         };
-        let moved = if in_ {
-            self.cursor.move_down(id, &self.graph)
-        } else {
-            self.cursor.move_up(id, &self.graph)
-        };
-        if moved {
-            // Zooming out folds the selection into its parent, which is the
-            // node the user is now looking at.
-            if !in_ {
-                self.selected = self.graph.get(id).and_then(|e| e.parent);
-            }
+        if self.cursor.move_up(id, &self.graph) {
+            // The node folds into its parent, which is what the user is now
+            // looking at.
+            self.selected = self.graph.get(id).and_then(|e| e.parent);
             self.rebuild();
         }
+    }
+
+    /// Fold a whole box back into one node: every active leaf under it moves
+    /// up until the box itself is the leaf.
+    fn collapse_into(&mut self, id: EntityId) {
+        loop {
+            let under: Vec<EntityId> = self
+                .cursor
+                .active()
+                .iter()
+                .copied()
+                .filter(|&l| l != id && is_under(&self.graph, l, id))
+                .collect();
+            if under.is_empty() {
+                break;
+            }
+            if under.into_iter().filter(|&l| self.cursor.move_up(l, &self.graph)).count() == 0 {
+                break;
+            }
+        }
+        self.selected = Some(id);
+        self.rebuild();
+    }
+
+    /// Draw the same graph larger or smaller, holding `screen` still. Nothing
+    /// enters or leaves the picture; the nodes are given fewer cells each.
+    fn set_zoom(&mut self, in_: bool, screen: (u16, u16)) {
+        let Some(next) = (if in_ { self.zoom.in_() } else { self.zoom.out() }) else { return };
+        // Whatever is under that cell is what the user is reading, so it is
+        // what the new size is measured around. Off the diagram -- in the
+        // margin around a small one -- there is nothing to hold.
+        let hold = self.camera.at(screen.0, screen.1).map(|p| (screen, p));
+        self.zoom = next;
+        self.rebuild_holding(hold);
+    }
+
+    /// The middle of the screen, for a zoom worked from the keyboard: there is
+    /// no pointer, and the middle is what the reader is looking at.
+    fn viewport_middle(&self) -> (u16, u16) {
+        let v = self.camera.viewport;
+        (v.x + v.width / 2, v.y + v.height / 2)
     }
 
     /// Route a mouse event. Scrolling pans, shift turns it sideways and ctrl
@@ -270,6 +346,7 @@ impl App {
         match ev.kind {
             MouseEventKind::ScrollUp if ctrl => self.zoom_at(ev.column, ev.row, true),
             MouseEventKind::ScrollDown if ctrl => self.zoom_at(ev.column, ev.row, false),
+
             MouseEventKind::ScrollUp if shift => self.camera.scroll(-WHEEL_X, 0),
             MouseEventKind::ScrollDown if shift => self.camera.scroll(WHEEL_X, 0),
             MouseEventKind::ScrollUp => self.camera.scroll(0, -WHEEL_Y),
@@ -285,8 +362,12 @@ impl App {
                     self.control(c);
                 }
             }
+            // A node's own buttons sit on its frame, which is inside its
+            // rect, so they have to be tried before the rect selects.
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(id) = self.leaf_under(ev.column, ev.row) {
+                if let Some((id, action)) = self.button_under(ev.column, ev.row) {
+                    self.node_action(id, action);
+                } else if let Some(id) = self.leaf_under(ev.column, ev.row) {
                     self.select(id);
                 }
             }
@@ -298,13 +379,50 @@ impl App {
         self.camera.at(col, row).and_then(|p| self.diagram.leaf_at(p))
     }
 
-    /// Zoom the node under the pointer rather than the selection: pointing at
-    /// something and turning the wheel should act on what is pointed at.
+    /// Zoom about the pointer: the cell it is on stays the cell it is on, so
+    /// the thing being read does not slide out from under it. The selection is
+    /// deliberately untouched -- pointing at something is not choosing it.
     fn zoom_at(&mut self, col: u16, row: u16, in_: bool) {
-        if let Some(id) = self.leaf_under(col, row) {
-            self.select(id);
+        self.set_zoom(in_, (col, row));
+    }
+
+    /// The button under a screen cell, if the pointer is on one. Searched
+    /// from the inside out, because a leaf is drawn over the box holding it.
+    fn button_under(&self, col: u16, row: u16) -> Option<(EntityId, NodeAction)> {
+        let p = self.camera.at(col, row)?;
+        // The diagram's own level, not the app's: they agree today, and the
+        // whole point of the diagram carrying one is that nothing has to
+        // remember to keep them agreeing.
+        let m = self.diagram.zoom.metrics();
+        let extent = self.diagram.extent();
+        self.diagram.nodes.iter().rev().find_map(|n| {
+            // A node the renderer refused to draw has no buttons to press.
+            if n.rect.right() > extent.0 || n.rect.bottom() > extent.1 {
+                return None;
+            }
+            let expandable = self.graph.get(n.id).is_some_and(|e| !e.children.is_empty());
+            let actions = controls::node_actions(n.is_box, expandable);
+            let bordered = n.is_box || m.bordered;
+            controls::node_action_at(n.rect, actions, bordered, p.0, p.1).map(|a| (n.id, a))
+        })
+    }
+
+    fn node_action(&mut self, id: EntityId, action: NodeAction) {
+        match action {
+            NodeAction::Expand => {
+                self.select(id);
+                self.expand();
+            }
+            NodeAction::Collapse => self.collapse_into(id),
+            NodeAction::Scope => {
+                self.settings.scope = Some(id);
+                self.rebuild();
+            }
+            NodeAction::Hide => {
+                self.settings.hidden.insert(id);
+                self.rebuild();
+            }
         }
-        self.zoom(in_);
     }
 
     fn status(&self) -> Line<'static> {
@@ -324,6 +442,10 @@ impl App {
                 Style::default().fg(Color::Red),
             ));
         }
+        spans.push(Span::styled(
+            format!("· {} ", self.zoom.name()),
+            Style::default().fg(Color::DarkGray),
+        ));
         let (row, last) = self.camera.row();
         spans.push(Span::raw(format!(
             "· {}x{} · row {}/{} ",
@@ -363,8 +485,8 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.camera.bottom(),
             KeyCode::Tab | KeyCode::Char('n') => self.step_selection(true),
             KeyCode::BackTab | KeyCode::Char('p') => self.step_selection(false),
-            KeyCode::Enter | KeyCode::Char('+') => self.zoom(true),
-            KeyCode::Backspace | KeyCode::Char('-') => self.zoom(false),
+            KeyCode::Enter | KeyCode::Char('+') => self.expand(),
+            KeyCode::Backspace | KeyCode::Char('-') => self.collapse(),
             KeyCode::Char(c) if controls::for_key(c).is_some() => {
                 let control = controls::for_key(c).expect("just checked");
                 if self.state(control).enabled() {
@@ -374,6 +496,18 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Is `id` inside `ancestor`?
+fn is_under(graph: &EntityGraph, id: EntityId, ancestor: EntityId) -> bool {
+    let mut cur = Some(id);
+    while let Some(c) = cur {
+        if c == ancestor {
+            return true;
+        }
+        cur = graph.get(c).and_then(|e| e.parent);
+    }
+    false
 }
 
 fn main() -> Result<()> {
@@ -419,7 +553,15 @@ fn restore() {
 }
 
 fn draw_keys(frame: &mut ratatui::Frame, area: Rect) {
-    let width = 52.min(area.width);
+    // Sized from the longest line rather than a guess: a fixed width silently
+    // clipped the ends of the descriptions, which is the one thing this panel
+    // exists to show.
+    let width = KEYS
+        .iter()
+        .map(|(k, what)| k.chars().count().max(20) + what.chars().count() + 4)
+        .max()
+        .unwrap_or(40)
+        .min(area.width as usize) as u16;
     let height = (KEYS.len() as u16 + 2).min(area.height);
     let panel = Rect::new(
         area.x + (area.width.saturating_sub(width)) / 2,
@@ -541,7 +683,7 @@ mod tests {
 
     fn app() -> App {
         let mut app = App::new(fixture(), Rect::new(0, 0, 60, 20));
-        // Zoom to the files; the root alone has nothing to scroll or select.
+        // Expand to the files; the root alone has nothing to scroll or select.
         for _ in 0..2 {
             for leaf in app.cursor.coalesced().leaves {
                 app.cursor.move_down(leaf, &app.graph);
@@ -615,14 +757,60 @@ mod tests {
         assert_eq!(app.selected, Some(id), "clicking nothing cleared the selection");
     }
 
-    /// Ctrl-scroll acts on what is pointed at, not on what happens to be
-    /// selected: the pointer has to move the selection *and* the zoom has to
-    /// land on the node it moved to.
+    /// Zooming out is about size, not content: the same nodes in fewer cells.
+    /// If the node set changes, something expanded or collapsed instead.
     #[test]
-    fn ctrl_scrolling_over_a_node_zooms_that_node() {
-        // Two folders side by side, so there is a second zoomable leaf to
-        // point at -- the shared fixture bottoms out at files, which cannot
-        // be zoomed into at all.
+    fn ctrl_scrolling_draws_the_same_graph_smaller() {
+        let mut app = app();
+        let before: Vec<EntityId> = app.diagram.nodes.iter().map(|n| n.id).collect();
+        let tall = app.diagram.height;
+        assert_eq!(app.zoom, Zoom::Close);
+
+        app.mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::CONTROL, 1, 1));
+        assert_eq!(app.zoom, Zoom::Mid);
+        let after: Vec<EntityId> = app.diagram.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(before, after, "zooming changed what was in the picture");
+        assert!(app.diagram.height < tall, "zooming out did not buy any room");
+
+        // The far end of the range holds rather than wrapping round.
+        app.mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::CONTROL, 1, 1));
+        app.mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::CONTROL, 1, 1));
+        assert_eq!(app.zoom, Zoom::Far);
+    }
+
+    /// Zooming is the one relayout where the picture does not change, so what
+    /// the pointer is on has to stay under the pointer. Routing it through
+    /// the ordinary "new picture" path sends a reader at the bottom of a long
+    /// diagram back to the top, which is what this pins against.
+    #[test]
+    fn ctrl_scrolling_holds_the_cell_under_the_pointer() {
+        let mut app = app();
+        assert!(app.diagram.height > app.camera.viewport.height * 2, "needs a tall diagram");
+        app.key(KeyCode::Char('G'), KeyModifiers::NONE);
+
+        // The middle column: a diagram narrower than the terminal is centred,
+        // so the left of the screen can be margin rather than diagram.
+        let screen = (app.camera.viewport.width / 2, app.camera.viewport.height - 3);
+        let (before, tall) = (
+            app.camera.at(screen.0, screen.1).expect("pointing at the diagram"),
+            app.diagram.height,
+        );
+        app.mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::CONTROL, screen.0, screen.1));
+
+        let after = app.camera.at(screen.0, screen.1).expect("still on the diagram");
+        let want = u32::from(before.1) * u32::from(app.diagram.height) / u32::from(tall);
+        assert!(
+            u32::from(after.1).abs_diff(want) <= 2,
+            "zooming moved the ground under the pointer: row {} became {}, wanted about {want}",
+            before.1,
+            after.1,
+        );
+    }
+
+    /// A node's own buttons are the browser's, and they have to do what the
+    /// panel row of the same name does.
+    #[test]
+    fn a_nodes_own_buttons_hide_and_expand_it() {
         let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
             ("root", Folder, None),
             ("left", Folder, Some(0)),
@@ -630,27 +818,41 @@ mod tests {
             ("a.rs", File, Some(1)),
             ("b.rs", File, Some(2)),
         ];
-        let graph = graph_from_parents(&rows, &[(3, 4, Call)]);
-        let mut app = App::new(graph, Rect::new(0, 0, 80, 24));
+        let mut app = App::new(graph_from_parents(&rows, &[(3, 4, Call)]), Rect::new(0, 0, 80, 24));
         app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> left, right
 
-        let target = app
-            .diagram
-            .nodes
-            .iter()
-            .filter(|n| !n.is_box)
-            .find(|n| Some(n.id) != app.selected)
-            .expect("both folders should be drawn");
-        let (id, rect) = (target.id, target.rect);
-        app.camera.reveal(rect);
-        let col = (i32::from(rect.x + 1) - app.camera.offset.0) as u16;
-        let row = (i32::from(rect.y + 1) - app.camera.offset.1) as u16;
+        let leaf = app.diagram.nodes.iter().find(|n| !n.is_box).expect("a leaf is drawn");
+        let (id, rect) = (leaf.id, leaf.rect);
+        let actions = controls::node_actions(false, true);
+        assert_eq!(actions, &[NodeAction::Expand, NodeAction::Hide]);
+        let (bx, by) = controls::node_action_row(rect, actions.len(), true).expect("room for buttons");
+        let screen = |app: &App, x: u16, y: u16| {
+            (
+                (i32::from(x) - app.camera.offset.0) as u16,
+                (i32::from(y) - app.camera.offset.1) as u16,
+            )
+        };
 
-        app.mouse(wheel(MouseEventKind::ScrollUp, KeyModifiers::CONTROL, col, row));
+        assert_eq!(
+            app.canvas[(bx, by)].symbol(),
+            "+",
+            "the button was hit-testable but never drawn"
+        );
+        let (col, row) = screen(&app, bx, by);
+        app.mouse(wheel(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE, col, row));
         assert!(
             app.diagram.nodes.iter().any(|n| n.id == id && n.is_box),
-            "the wheel zoomed something other than the node under it"
+            "the + button did not expand the node"
         );
+
+        // ... and the × button on the box it just became takes it away.
+        let rect = app.diagram.rect_of(id).expect("still drawn");
+        let box_actions = controls::node_actions(true, true);
+        let (bx, by) = controls::node_action_row(rect, box_actions.len(), true).expect("room");
+        let hide_at = bx + box_actions.iter().position(|a| *a == NodeAction::Hide).unwrap() as u16;
+        let (col, row) = screen(&app, hide_at, by);
+        app.mouse(wheel(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE, col, row));
+        assert!(!app.diagram.nodes.iter().any(|n| n.id == id), "the × button did not hide the box");
     }
 
     #[test]
@@ -687,8 +889,8 @@ mod tests {
         let area = app.camera.viewport;
         let mut buf = ratatui::buffer::Buffer::empty(area);
         let states: Vec<(Control, State)> =
-            [Control::Tests, Control::OnePerPair, Control::Edges, Control::Hide,
-             Control::Scope, Control::ShowAll, Control::Reset]
+            [Control::Zoom, Control::Tests, Control::OnePerPair, Control::Edges,
+             Control::Hide, Control::Scope, Control::ShowAll, Control::CollapseAll]
                 .into_iter()
                 .map(|c| (c, app.state(c)))
                 .collect();
@@ -750,7 +952,7 @@ mod tests {
     fn clicking_a_switch_does_what_its_key_does() {
         let mut app = app();
         draw_panel(&mut app);
-        let row = app.panel.rect.y + 1; // the first control: tests
+        let row = app.panel.rect.y + 1 + 1; // zoom, then tests
         assert!(app.settings.show_tests);
 
         app.mouse(wheel(
@@ -796,19 +998,19 @@ mod tests {
         assert!(!app.quit, "the dismissing press also quit");
     }
 
-    /// The selection has to survive a rebuild, or zooming leaves the user with
-    /// nothing selected and no way back.
+    /// The selection has to survive a rebuild, or expanding leaves the user
+    /// with nothing selected and no way back.
     #[test]
-    fn zooming_keeps_something_selected() {
+    fn expanding_and_collapsing_keep_something_selected() {
         let mut app = App::new(fixture(), Rect::new(0, 0, 60, 20));
         assert!(app.selected.is_some());
         for _ in 0..3 {
             app.key(KeyCode::Enter, KeyModifiers::NONE);
-            assert!(app.selected.is_some(), "zooming in lost the selection");
+            assert!(app.selected.is_some(), "expanding lost the selection");
         }
         for _ in 0..3 {
             app.key(KeyCode::Backspace, KeyModifiers::NONE);
-            assert!(app.selected.is_some(), "zooming out lost the selection");
+            assert!(app.selected.is_some(), "collapsing lost the selection");
         }
     }
 }

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap as Map, BinaryHeap};
 
 use super::id::{NodeId, PortId};
 
-/// Pops allowed per connection. Measured over six zoom levels of this repo:
+/// Pops allowed per connection. Measured over six expansion depths of this repo:
 /// upstream's 5000 leaves 41% of edges unrouted, 20,000 leaves 32%, and
 /// 200,000 leaves 30% while taking nine times as long.
 ///
