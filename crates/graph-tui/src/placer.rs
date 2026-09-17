@@ -12,24 +12,27 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use entity_graph::{EntityGraph, EntityId};
 
+use crate::label::Labels;
 use crate::view::Picture;
 use ratatui::layout::Rect;
 
 /// Gap between siblings, and the rows between ranks where horizontal runs of
-/// an edge travel. Two rows is enough for a turn; three keeps parallel runs
-/// from sharing a row so often.
-const GAP_X: u16 = 2;
-const GAP_Y: u16 = 4;
+/// an edge travel. Both are wider than the minimum that works: at the minimum
+/// the boxes read as one wall of border characters, and every horizontal run
+/// of every edge competes for the same two rows.
+const GAP_X: u16 = 4;
+const GAP_Y: u16 = 6;
 /// A box spends a row on its own name, plus a border on each side.
 const BOX_PAD: u16 = 1;
 const LABEL_H: u16 = 1;
-const LEAF_H: u16 = 3;
+/// Border, name, what kind of thing it is, border.
+const LEAF_H: u16 = 4;
 /// However deep the nesting, a box always keeps room for one clamped leaf.
-const MIN_INNER_W: u16 = 30;
+const MIN_INNER_W: u16 = 34;
 /// No label sets the width of the thing holding it. Minified sources really do
 /// produce identifiers tens of thousands of characters long, and one of them
 /// otherwise sizes a box past what the arithmetic below can hold.
-const LABEL_MAX: usize = 28;
+const LABEL_MAX: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct Placed {
@@ -54,19 +57,48 @@ pub struct Diagram {
     pub height: u16,
 }
 
-/// Display width of a leaf's label, bounded so one long name cannot set the
-/// width of a whole rank.
-fn label_width(graph: &EntityGraph, id: EntityId) -> u16 {
-    let name = graph.get(id).map(|e| e.name.as_str()).unwrap_or("?");
-    unicode_width::UnicodeWidthStr::width(name).clamp(6, LABEL_MAX) as u16
+impl Diagram {
+    pub fn extent(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
+
+    /// The leaf drawn at a diagram cell. Boxes are deliberately not hit: a box
+    /// is an ancestor of whatever is being pointed at, and the selection has
+    /// to stay a leaf for zooming to have something to act on.
+    pub fn leaf_at(&self, point: (u16, u16)) -> Option<EntityId> {
+        self.nodes
+            .iter()
+            .find(|n| !n.is_box && n.rect.contains(point.into()))
+            .map(|n| n.id)
+    }
+
+    pub fn rect_of(&self, id: EntityId) -> Option<Rect> {
+        self.nodes.iter().find(|n| n.id == id).map(|n| n.rect)
+    }
+}
+
+fn width_of(text: &str) -> u16 {
+    unicode_width::UnicodeWidthStr::width(text).clamp(6, LABEL_MAX) as u16
+}
+
+/// Display width of what a node has to fit, bounded so one long name cannot
+/// set the width of a whole rank. A leaf is sized by whichever of its two
+/// lines is wider -- sizing it by the name alone truncates `function · 10–30`
+/// on every short-named function there is.
+fn label_width(labels: &Labels, id: EntityId, is_box: bool) -> u16 {
+    if is_box {
+        width_of(&labels.box_label(id))
+    } else {
+        width_of(labels.name(id)).max(width_of(&labels.detail(id)))
+    }
 }
 
 /// Wide enough for its label and for one port per edge touching it. Ports are
 /// spread along the border, so a node narrower than its own degree has to reuse
 /// a coordinate -- and a reused port is an exclusive cell, so the second edge
 /// to claim it simply never routes.
-fn leaf_size(graph: &EntityGraph, id: EntityId, degree: u16) -> (u16, u16) {
-    (label_width(graph, id).max(degree) + 2, LEAF_H)
+fn leaf_size(labels: &Labels, id: EntityId, degree: u16) -> (u16, u16) {
+    (label_width(labels, id, false).max(degree) + 2, LEAF_H)
 }
 
 /// Ancestor chain from the outermost container down to `id` itself.
@@ -204,8 +236,8 @@ fn pack(sizes: &[(u16, u16)], edges: &[(usize, usize)], max_w: u16) -> (Vec<(u16
     (pos, widest, y.saturating_sub(GAP_Y))
 }
 
-struct Ctx<'a> {
-    graph: &'a EntityGraph,
+struct Ctx<'a, 'g> {
+    labels: &'a Labels<'g>,
     /// Direct children of each container that are actually in view.
     kids: BTreeMap<EntityId, Vec<EntityId>>,
     /// Edge ends touching each drawn node, which sets how many ports it needs.
@@ -214,7 +246,7 @@ struct Ctx<'a> {
     inner: BTreeMap<EntityId, Vec<(EntityId, EntityId)>>,
 }
 
-impl Ctx<'_> {
+impl Ctx<'_, '_> {
     /// Size a node and everything under it, returning its own extent. Children
     /// are positioned relative to the node; `emit` shifts them absolute.
     fn size(
@@ -225,7 +257,7 @@ impl Ctx<'_> {
     ) -> (u16, u16) {
         let deg = self.degree.get(&id).copied().unwrap_or(0);
         let Some(kids) = self.kids.get(&id) else {
-            let s = leaf_size(self.graph, id, deg);
+            let s = leaf_size(self.labels, id, deg);
             out.insert(id, s);
             return s;
         };
@@ -247,7 +279,7 @@ impl Ctx<'_> {
             .map(|es| es.iter().filter_map(|(a, b)| Some((*idx.get(a)?, *idx.get(b)?))).collect())
             .unwrap_or_default();
         let (_, w, h) = pack(&sizes, &edges, inner_avail);
-        let label_w = label_width(self.graph, id).max(deg) + 2;
+        let label_w = label_width(self.labels, id, true).max(deg) + 2;
         // Never wider than the room its parent had to give. Without this the
         // `MIN_INNER_W` floor leaks: once the available width bottoms out,
         // every further level still wraps its child in four more columns, and
@@ -295,7 +327,8 @@ impl Ctx<'_> {
 }
 
 /// Lay out one zoom level. `max_w` bounds a rank before it wraps.
-pub fn place(graph: &EntityGraph, picture: &Picture, max_w: u16) -> Diagram {
+pub fn place(labels: &Labels, picture: &Picture, max_w: u16) -> Diagram {
+    let graph = labels.graph;
     let leaves: BTreeSet<EntityId> = picture.nodes.iter().copied().collect();
     let chains: BTreeMap<EntityId, Vec<EntityId>> =
         leaves.iter().map(|&l| (l, lineage(graph, l))).collect();
@@ -352,7 +385,7 @@ pub fn place(graph: &EntityGraph, picture: &Picture, max_w: u16) -> Diagram {
         *degree.entry(e.from).or_default() += 1;
         *degree.entry(e.to).or_default() += 1;
     }
-    let ctx = Ctx { graph, kids, inner, degree };
+    let ctx = Ctx { labels, kids, inner, degree };
     let mut sizes = HashMap::new();
     for &r in &roots {
         ctx.size(r, max_w, &mut sizes);
@@ -411,7 +444,7 @@ mod tests {
             ],
             &[],
         );
-        let d = place(&graph, &fully_zoomed(&graph), 200);
+        let d = place(&Labels::new(&graph), &fully_zoomed(&graph), 200);
         let folder = rect_of(&d, &graph, "root");
         assert!(d.nodes.iter().find(|n| n.id.0 == 0).unwrap().is_box);
         for file in ["a.rs", "b.rs", "c.rs"] {
@@ -425,7 +458,7 @@ mod tests {
             &[("root", Folder, None), ("caller.rs", File, Some(0)), ("callee.rs", File, Some(0))],
             &[(1, 2, Call)],
         );
-        let d = place(&graph, &fully_zoomed(&graph), 200);
+        let d = place(&Labels::new(&graph), &fully_zoomed(&graph), 200);
         let caller = rect_of(&d, &graph, "caller.rs");
         let callee = rect_of(&d, &graph, "callee.rs");
         assert!(caller.y < callee.y, "caller {caller:?} should rank above callee {callee:?}");
@@ -441,7 +474,7 @@ mod tests {
             &[("root", Folder, None), ("one.rs", File, Some(0)), ("two.rs", File, Some(0))],
             &[(1, 2, Call), (2, 1, Call)],
         );
-        let d = place(&graph, &fully_zoomed(&graph), 200);
+        let d = place(&Labels::new(&graph), &fully_zoomed(&graph), 200);
         assert_ne!(rect_of(&d, &graph, "one.rs"), rect_of(&d, &graph, "two.rs"));
     }
 
@@ -460,9 +493,9 @@ mod tests {
         let graph = graph_from_parents(&rows, &refs);
         let coalesced = fully_zoomed(&graph);
 
-        let first = place(&graph, &coalesced, 80);
+        let first = place(&Labels::new(&graph), &coalesced, 80);
         for _ in 0..5 {
-            let again = place(&graph, &coalesced, 80);
+            let again = place(&Labels::new(&graph), &coalesced, 80);
             assert_eq!(first.width, again.width);
             assert_eq!(first.height, again.height);
             let a: Vec<_> = first.nodes.iter().map(|n| (n.id, n.rect)).collect();
@@ -486,7 +519,7 @@ mod tests {
             let files: Vec<String> = (0..6).map(|i| format!("some_file_{i:02}.rs")).collect();
             rows.extend(files.iter().map(|n| (n.as_str(), File, Some(levels))));
             let graph = graph_from_parents(&rows, &[]);
-            let d = place(&graph, &fully_zoomed(&graph), 100);
+            let d = place(&Labels::new(&graph), &fully_zoomed(&graph), 100);
             assert!(d.width <= 100, "{levels} levels of nesting reached {} columns", d.width);
         }
     }
@@ -502,7 +535,7 @@ mod tests {
         let files: Vec<String> = (0..8).map(|i| format!("wide_file_name_{i:02}.rs")).collect();
         rows.extend(files.iter().map(|n| (n.as_str(), File, Some(deep.len()))));
         let graph = graph_from_parents(&rows, &[]);
-        let d = place(&graph, &fully_zoomed(&graph), 100);
+        let d = place(&Labels::new(&graph), &fully_zoomed(&graph), 100);
         assert!(d.width <= 100, "six levels of nesting reached {} columns", d.width);
     }
 
@@ -521,7 +554,7 @@ mod tests {
             ],
             &[],
         );
-        let d = place(&graph, &fully_zoomed(&graph), 120);
+        let d = place(&Labels::new(&graph), &fully_zoomed(&graph), 120);
         assert!(d.width <= 120, "one long label widened the diagram to {}", d.width);
     }
 
@@ -533,14 +566,14 @@ mod tests {
         rows.extend(names.iter().map(|n| (n.as_str(), File, Some(0))));
         let graph = graph_from_parents(&rows, &[]);
 
-        let narrow = place(&graph, &fully_zoomed(&graph), 60);
+        let narrow = place(&Labels::new(&graph), &fully_zoomed(&graph), 60);
         assert!(narrow.width <= 60, "wrapped layout is {} wide", narrow.width);
         let rows_used: std::collections::HashSet<u16> =
             narrow.nodes.iter().filter(|n| !n.is_box).map(|n| n.rect.y).collect();
         assert!(rows_used.len() > 1, "a 12-node rank should not fit one 60-column row");
 
         // The same graph with room to spare keeps them on one row.
-        let wide = place(&graph, &fully_zoomed(&graph), 400);
+        let wide = place(&Labels::new(&graph), &fully_zoomed(&graph), 400);
         let wide_rows: std::collections::HashSet<u16> =
             wide.nodes.iter().filter(|n| !n.is_box).map(|n| n.rect.y).collect();
         assert_eq!(wide_rows.len(), 1);

@@ -7,11 +7,12 @@
 
 use std::collections::HashMap;
 
-use entity_graph::{EntityGraph, EntityId, EntityKind};
+use entity_graph::{EntityId, EntityKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::label::Labels;
 use crate::placer::Diagram;
 use crate::router::{Connection, ConnectionsLayout, FlowDirection, LineType};
 
@@ -23,17 +24,44 @@ pub struct Stats {
     pub unroutable: usize,
 }
 
+/// The browser view's palette, so the same kind is the same colour in both.
 fn kind_colour(kind: EntityKind) -> Color {
     match kind {
-        EntityKind::Folder => Color::Blue,
-        EntityKind::Module => Color::Cyan,
-        EntityKind::File => Color::White,
+        EntityKind::Folder => Color::Yellow,
+        EntityKind::Module => Color::Blue,
+        EntityKind::File => Color::Green,
         EntityKind::Class => Color::Magenta,
-        EntityKind::Function => Color::Green,
+        EntityKind::Function => Color::Gray,
     }
 }
 
-fn draw_box(buf: &mut Buffer, r: Rect, label: &str, is_box: bool, style: Style) {
+/// How a node and its second line are painted.
+///
+/// A cell's style is *patched*, not replaced: `Cell::set_style` inserts the
+/// modifiers a style adds and removes only the ones it names. A plain
+/// `Style::default()` names none, so painting a node back to its own colour
+/// leaves BOLD and REVERSED behind and the node the selection just left stays
+/// lit. The two styles have to be written as each other's undo -- which is
+/// also why the second line is dimmed with a colour rather than with the DIM
+/// modifier.
+///
+/// Selection reverses a node in its own colour rather than recolouring it:
+/// the colour is the only thing saying what kind of node it is, and a
+/// selection that painted over it would hide that just as you looked at it.
+fn node_style(kind: EntityKind, selected: bool) -> (Style, Style) {
+    let stale = Modifier::BOLD | Modifier::REVERSED;
+    if selected {
+        let s = Style::default().fg(kind_colour(kind)).add_modifier(stale);
+        (s, s)
+    } else {
+        (
+            Style::default().fg(kind_colour(kind)).remove_modifier(stale),
+            Style::default().fg(Color::DarkGray).remove_modifier(stale),
+        )
+    }
+}
+
+fn draw_box(buf: &mut Buffer, r: Rect, lines: [&str; 2], is_box: bool, style: (Style, Style)) {
     if r.width < 2 || r.height < 2 || r.right() > buf.area().width || r.bottom() > buf.area().height
     {
         return;
@@ -42,26 +70,37 @@ fn draw_box(buf: &mut Buffer, r: Rect, label: &str, is_box: bool, style: Style) 
     // leaf. Routed edges are square-cornered for the same reason.
     let (tl, tr, bl, br, h, v) =
         if is_box { ('┏', '┓', '┗', '┛', '━', '┃') } else { ('╭', '╮', '╰', '╯', '─', '│') };
+    let style = (style.0, if is_box { style.0 } else { style.1 });
     for x in r.x..r.right() {
-        buf[(x, r.y)].set_symbol(&h.to_string()).set_style(style);
-        buf[(x, r.bottom() - 1)].set_symbol(&h.to_string()).set_style(style);
+        buf[(x, r.y)].set_symbol(&h.to_string()).set_style(style.0);
+        buf[(x, r.bottom() - 1)].set_symbol(&h.to_string()).set_style(style.0);
     }
     for y in r.y..r.bottom() {
-        buf[(r.x, y)].set_symbol(&v.to_string()).set_style(style);
-        buf[(r.right() - 1, y)].set_symbol(&v.to_string()).set_style(style);
+        buf[(r.x, y)].set_symbol(&v.to_string()).set_style(style.0);
+        buf[(r.right() - 1, y)].set_symbol(&v.to_string()).set_style(style.0);
     }
     for (pos, c) in [((r.x, r.y), tl), ((r.right() - 1, r.y), tr), ((r.x, r.bottom() - 1), bl), ((r.right() - 1, r.bottom() - 1), br)] {
-        buf[pos].set_symbol(&c.to_string()).set_style(style);
+        buf[pos].set_symbol(&c.to_string()).set_style(style.0);
     }
+    // Whole rows are painted, not just their characters: under REVERSED a
+    // half-painted row shows the highlight breaking off mid-node.
     let room = r.width.saturating_sub(2) as usize;
-    for (i, c) in label.chars().take(room).enumerate() {
-        buf[(r.x + 1 + i as u16, r.y + 1)].set_symbol(&c.to_string()).set_style(style);
+    for (row, (text, st)) in lines.iter().zip([style.0, style.1]).enumerate() {
+        let y = r.y + 1 + row as u16;
+        if text.is_empty() || y + 1 >= r.bottom() {
+            continue;
+        }
+        let mut chars = text.chars().take(room);
+        for i in 0..room {
+            let c = chars.next().unwrap_or(' ');
+            buf[(r.x + 1 + i as u16, y)].set_symbol(&c.to_string()).set_style(st);
+        }
     }
 }
 
 /// Render `d` at full size. The returned buffer's area is the diagram's own
 /// extent, not any terminal's.
-pub fn render(graph: &EntityGraph, d: &Diagram, selected: Option<EntityId>) -> (Buffer, Stats) {
+pub fn render(labels: &Labels, d: &Diagram, selected: Option<EntityId>) -> (Buffer, Stats) {
     let canvas = Rect { x: 0, y: 0, width: d.width.max(1), height: d.height.max(1) };
     let mut buf = Buffer::empty(canvas);
     let idx: HashMap<EntityId, usize> = d.nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
@@ -139,12 +178,7 @@ pub fn render(graph: &EntityGraph, d: &Diagram, selected: Option<EntityId>) -> (
     rt.render(canvas, &mut buf);
 
     for n in &d.nodes {
-        let Some(entity) = graph.get(n.id) else { continue };
-        let mut style = Style::default().fg(kind_colour(entity.kind));
-        if Some(n.id) == selected {
-            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        }
-        draw_box(&mut buf, n.rect, &entity.name, n.is_box, style);
+        paint(labels, &mut buf, n.id, n.rect, n.is_box, selected);
     }
 
     // Only the router was forked; the upstream widget draws arrowheads itself,
@@ -165,43 +199,62 @@ pub fn render(graph: &EntityGraph, d: &Diagram, selected: Option<EntityId>) -> (
 /// is far too slow for a keypress, and re-routing would also let unrelated
 /// edges shift under the user for no reason they can see.
 pub fn restyle(
-    graph: &EntityGraph,
+    labels: &Labels,
     d: &Diagram,
     buf: &mut Buffer,
     changed: &[EntityId],
     selected: Option<EntityId>,
 ) {
     for &id in changed {
-        let (Some(node), Some(entity)) = (d.nodes.iter().find(|n| n.id == id), graph.get(id))
-        else {
-            continue;
-        };
-        let mut style = Style::default().fg(kind_colour(entity.kind));
-        if Some(id) == selected {
-            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        }
-        draw_box(buf, node.rect, &entity.name, node.is_box, style);
+        let Some(node) = d.nodes.iter().find(|n| n.id == id) else { continue };
+        paint(labels, buf, id, node.rect, node.is_box, selected);
     }
 }
 
+/// One node, border and text, in whatever state it is in.
+fn paint(
+    labels: &Labels,
+    buf: &mut Buffer,
+    id: EntityId,
+    rect: Rect,
+    is_box: bool,
+    selected: Option<EntityId>,
+) {
+    let Some(kind) = labels.kind(id) else { return };
+    let style = node_style(kind, Some(id) == selected);
+    // A box has one row to spend, so its size goes beside its name; a leaf has
+    // two and puts what kind of thing it is underneath.
+    let (head, detail) = if is_box {
+        (labels.box_label(id), String::new())
+    } else {
+        (labels.name(id).to_string(), labels.detail(id))
+    };
+    draw_box(buf, rect, [&head, &detail], is_box, style);
+}
+
 /// Copy the window of `src` at `offset` into `area` of `dst`.
-pub fn blit(src: &Buffer, dst: &mut Buffer, area: Rect, offset: (u16, u16)) {
+///
+/// The offset is signed because a diagram smaller than the viewport is centred
+/// in it, and the cells outside the diagram are simply left as they are.
+pub fn blit(src: &Buffer, dst: &mut Buffer, area: Rect, offset: (i32, i32)) {
     let bounds = *dst.area();
     for y in 0..area.height {
         for x in 0..area.width {
-            let (sx, sy) = (x.saturating_add(offset.0), y.saturating_add(offset.1));
+            let (sx, sy) = (i32::from(x) + offset.0, i32::from(y) + offset.1);
             let (dx, dy) = (area.x + x, area.y + y);
             // Both ends are checked: a window larger than the frame is a
             // caller's arithmetic slip, and panicking mid-frame takes the
             // whole app down with the terminal still in raw mode.
-            if sx >= src.area().width
-                || sy >= src.area().height
-                || dx >= bounds.width
-                || dy >= bounds.height
+            if sx < 0
+                || sy < 0
+                || sx >= i32::from(src.area().width)
+                || sy >= i32::from(src.area().height)
+                || dx >= bounds.right()
+                || dy >= bounds.bottom()
             {
                 continue;
             }
-            dst[(dx, dy)] = src[(sx, sy)].clone();
+            dst[(dx, dy)] = src[(sx as u16, sy as u16)].clone();
         }
     }
 }
@@ -237,9 +290,50 @@ mod tests {
             width: 190,
             height: 410,
         };
-        let (_, stats) = render(&graph, &d, None);
+        let (_, stats) = render(&Labels::new(&graph), &d, None);
         assert_eq!(stats.submitted, 1);
         assert_eq!(stats.unroutable, 0, "a route 400 rows long should still be found");
+    }
+
+    /// Selection is a highlight you move, so the node it left has to go back
+    /// to looking like every other node. It did not: a cell's style is patched
+    /// rather than replaced, so REVERSED survived being painted over and the
+    /// whole trail of visited nodes stayed lit.
+    #[test]
+    fn stepping_the_selection_off_a_node_takes_the_highlight_with_it() {
+        let graph = graph_from_parents(
+            &[("root", Folder, None), ("a.rs", File, Some(0)), ("b.rs", File, Some(0))],
+            &[],
+        );
+        let (a, b) = (EntityId(1), EntityId(2));
+        let d = Diagram {
+            nodes: vec![
+                Placed { id: a, rect: Rect::new(0, 0, 10, 3), is_box: false },
+                Placed { id: b, rect: Rect::new(0, 4, 10, 3), is_box: false },
+            ],
+            edges: vec![],
+            width: 10,
+            height: 7,
+        };
+        let lit = |buf: &Buffer, r: Rect| {
+            (r.y..r.bottom()).flat_map(|y| (r.x..r.right()).map(move |x| (x, y))).any(|p| {
+                buf[p].modifier.intersects(Modifier::REVERSED | Modifier::BOLD)
+            })
+        };
+
+        let (mut buf, _) = render(&Labels::new(&graph), &d, Some(a));
+        assert!(lit(&buf, d.nodes[0].rect), "the selected node should stand out");
+        assert!(!lit(&buf, d.nodes[1].rect));
+        let r = d.nodes[0].rect;
+        assert!(
+            (r.x + 1..r.right() - 1)
+                .all(|x| buf[(x, r.y + 1)].modifier.contains(Modifier::REVERSED)),
+            "the highlight stops partway across the name row"
+        );
+
+        restyle(&Labels::new(&graph), &d, &mut buf, &[a, b], Some(b));
+        assert!(lit(&buf, d.nodes[1].rect), "the selection did not arrive");
+        assert!(!lit(&buf, d.nodes[0].rect), "the node the selection left is still lit");
     }
 
     /// An unroutable edge draws no line, so its arrowhead would be a head with
@@ -268,7 +362,7 @@ mod tests {
             width: 10,
             height: 9,
         };
-        let (buf, stats) = render(&graph, &d, None);
+        let (buf, stats) = render(&Labels::new(&graph), &d, None);
         assert_eq!(stats.submitted, 1);
         assert_eq!(stats.unroutable, 1, "this edge has nowhere to go; the test proves nothing if it routes");
         let arrows = (0..buf.area().height)

@@ -11,6 +11,8 @@
 //! cursor's vocabulary. Owning the type now keeps that a change to our own
 //! struct rather than a change to somebody's signature.
 
+use std::collections::BTreeSet;
+
 use coalesce::Coalesced;
 use entity_graph::{EntityGraph, EntityId, ReferenceId, ReferenceKind};
 
@@ -30,7 +32,7 @@ pub struct Picture {
     pub edges: Vec<Edge>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Settings {
     /// Matches the browser, which starts with tests shown: leaving them out by
     /// default would quietly disagree with the view this replaces.
@@ -39,11 +41,24 @@ pub struct Settings {
     /// files usually relate several ways at once, and drawing each separately
     /// multiplies the lines without adding information.
     pub one_per_pair: bool,
+    /// Entities the user took out of the picture. Hiding one hides everything
+    /// under it: an entity is a subtree, and leaving the children of a hidden
+    /// folder on screen would be showing what was just dismissed.
+    pub hidden: BTreeSet<EntityId>,
+    /// Show only this entity and what is under it. Where hiding says "not
+    /// that", scoping says "only this"; a graph gets large enough that picking
+    /// out the one subtree is the faster of the two.
+    pub scope: Option<EntityId>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { show_tests: true, one_per_pair: true }
+        Self {
+            show_tests: true,
+            one_per_pair: true,
+            hidden: BTreeSet::new(),
+            scope: None,
+        }
     }
 }
 
@@ -60,13 +75,34 @@ fn rank(kind: ReferenceKind) -> u8 {
     }
 }
 
+/// Does `id`, or anything holding it, satisfy `wanted`?
+fn lineage_has(graph: &EntityGraph, id: EntityId, wanted: impl Fn(EntityId) -> bool) -> bool {
+    let mut cur = Some(id);
+    while let Some(c) = cur {
+        if wanted(c) {
+            return true;
+        }
+        cur = graph.get(c).and_then(|e| e.parent);
+    }
+    false
+}
+
 /// Narrow a zoom level to what should actually be drawn.
 pub fn apply(graph: &EntityGraph, coalesced: &Coalesced, settings: &Settings) -> Picture {
+    // Hiding and scoping are asked of an *ancestor*, but the cursor hands back
+    // leaves, so both questions are answered by walking up from each leaf.
     let nodes: Vec<EntityId> = coalesced
         .leaves
         .iter()
         .copied()
         .filter(|&l| settings.show_tests || !graph.get(l).is_some_and(|e| e.is_test))
+        .filter(|&l| {
+            settings.hidden.is_empty() || !lineage_has(graph, l, |c| settings.hidden.contains(&c))
+        })
+        .filter(|&l| match settings.scope {
+            None => true,
+            Some(s) => lineage_has(graph, l, |c| c == s),
+        })
         .collect();
 
     let kept: std::collections::BTreeSet<EntityId> = nodes.iter().copied().collect();
@@ -130,6 +166,42 @@ mod tests {
         assert_eq!(collapsed.edges.len(), 1);
         assert_eq!(collapsed.edges[0].kind, Call, "a call outranks the import that enabled it");
         assert_eq!(collapsed.edges[0].refs.len(), 2, "both references are kept on the one edge");
+    }
+
+    /// Hiding is asked of one entity but means its whole subtree, and scoping
+    /// is the same walk read the other way round. Both are checked here
+    /// against a leaf two levels below the entity named, which is the case
+    /// that a naive `nodes.contains(id)` test would get wrong.
+    #[test]
+    fn hiding_a_folder_hides_what_is_under_it_and_scoping_keeps_only_that() {
+        let graph = graph_from_parents(
+            &[
+                ("root", Folder, None),
+                ("src", Folder, Some(0)),
+                ("lib.rs", File, Some(1)),
+                ("docs", Folder, Some(0)),
+                ("readme.md", File, Some(3)),
+            ],
+            &[(2, 4, Call)],
+        );
+        let (src, lib, docs) = (EntityId(1), EntityId(2), EntityId(4));
+        let named = |p: &Picture| p.nodes.clone();
+
+        let all = apply(&graph, &zoomed(&graph), &Settings::default());
+        assert!(named(&all).contains(&lib) && named(&all).contains(&docs));
+
+        let hidden = apply(
+            &graph,
+            &zoomed(&graph),
+            &Settings { hidden: [src].into_iter().collect(), ..Default::default() },
+        );
+        assert!(!named(&hidden).contains(&lib), "hiding a folder left its file behind");
+        assert!(named(&hidden).contains(&docs), "hiding one folder took out another");
+        assert!(hidden.edges.is_empty(), "an edge survived the node it came from");
+
+        let scoped =
+            apply(&graph, &zoomed(&graph), &Settings { scope: Some(src), ..Default::default() });
+        assert_eq!(named(&scoped), vec![lib], "scoping should keep only what is under it");
     }
 
     /// Dropping a test leaf has to drop its edges too, or the placer is handed

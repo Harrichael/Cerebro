@@ -1,4 +1,5 @@
 //! One number set, six levels, so before/after are actually comparable.
+use graph_tui::label::Labels;
 use graph_tui::{placer, render, view};
 use std::time::Instant;
 fn main() -> anyhow::Result<()> {
@@ -12,9 +13,10 @@ fn main() -> anyhow::Result<()> {
         let mut c = coalesce::Cursor::new(&graph);
         for _ in 0..depth { for l in c.coalesced().leaves { c.move_down(l, &graph); } }
         let pic = view::apply(&graph, &c.coalesced(), &Default::default());
-        let d = placer::place(&graph, &pic, 200);
+        let labels = Labels::new(&graph);
+        let d = placer::place(&labels, &pic, 200);
         let t = Instant::now();
-        let (buf, s) = render::render(&graph, &d, None);
+        let (buf, s) = render::render(&labels, &d, None);
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         // Detour: drawn line cells against straight-line distance, as a crude
         // check that routes are not snaking across the whole canvas.

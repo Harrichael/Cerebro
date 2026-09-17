@@ -5,6 +5,7 @@
 //!   cargo run -p graph-tui --example spike -- <path> [depth] [width]
 
 use graph_tui::view::Settings;
+use graph_tui::label::Labels;
 use graph_tui::{placer, render, view};
 
 fn main() -> anyhow::Result<()> {
@@ -23,8 +24,9 @@ fn main() -> anyhow::Result<()> {
 
     let settings = Settings::default();
     let picture = view::apply(&graph, &cursor.coalesced(), &settings);
-    let diagram = placer::place(&graph, &picture, width);
-    let (buf, stats) = render::render(&graph, &diagram, None);
+    let labels = Labels::new(&graph);
+    let diagram = placer::place(&labels, &picture, width);
+    let (buf, stats) = render::render(&labels, &diagram, None);
 
     for y in 0..buf.area().height {
         let row: String =
