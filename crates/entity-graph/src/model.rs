@@ -143,4 +143,38 @@ impl EntityGraph {
         }
         Some(cur.id)
     }
+
+    /// `(loc, test_loc)` per entity, indexed by [`EntityId`]. `loc` is the
+    /// inclusive line range when the entity has one, otherwise (folders) the
+    /// sum over its children; `test_loc` is how much of that is test code, so
+    /// a view hiding tests can subtract it. Post-order over the forest, so
+    /// every child is settled before its parent is read.
+    ///
+    /// `skip` leaves a child out of its parent's sum while letting the child
+    /// keep its own total. A diff view needs exactly that: the graph is the
+    /// union of both sides, but a folder's size is what the working tree holds
+    /// now, while a deleted file still has the size it had. Pass `|_| false`
+    /// when there is no such distinction to make.
+    pub fn loc_per_entity(&self, skip: impl Fn(EntityId) -> bool) -> Vec<(usize, usize)> {
+        let mut loc = vec![(0, 0); self.entities.len()];
+        let mut stack: Vec<(EntityId, bool)> =
+            self.entities.iter().filter(|e| e.parent.is_none()).map(|e| (e.id, false)).collect();
+        while let Some((id, children_done)) = stack.pop() {
+            let e = &self.entities[id.0];
+            if !children_done {
+                stack.push((id, true));
+                stack.extend(e.children.iter().map(|&c| (c, false)));
+                continue;
+            }
+            let current = || e.children.iter().filter(|&&c| skip(id) || !skip(c)).map(|c| loc[c.0]);
+            let own = if e.line_range != (0..0) {
+                e.line_range.end - e.line_range.start + 1
+            } else {
+                current().map(|l| l.0).sum()
+            };
+            let test = if e.is_test { own } else { current().map(|l| l.1).sum() };
+            loc[id.0] = (own, test);
+        }
+        loc
+    }
 }

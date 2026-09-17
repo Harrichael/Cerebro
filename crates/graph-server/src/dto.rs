@@ -6,7 +6,7 @@
 //! serializes byte-identically to before diffing existed.
 
 use coalesce::{Coalesced, CoalescedEdge};
-use entity_graph::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
+use entity_graph::{Entity, EntityGraph, EntityKind, Reference, ReferenceKind};
 use graph_diff::{LineOp, Status, Tag};
 use serde::Serialize;
 
@@ -240,40 +240,6 @@ fn node_dto(e: &Entity, (loc, test_loc): (usize, usize)) -> NodeDto {
     }
 }
 
-/// `(loc, test_loc)` per entity. `loc` is the inclusive line range when the
-/// entity has one, otherwise (folders) the sum over its children; `test_loc`
-/// is how much of that is test code, so a view hiding tests can subtract it.
-/// Post-order over the forest so every child is settled before its parent is
-/// read.
-///
-/// In diff mode the graph is the union of both sides, but a folder's total is
-/// what the working tree holds now, so a child the diff removed is left out
-/// of its parent's sum. A removed entity itself is entirely old side and keeps
-/// its old size, folder or file alike, rather than reading as empty.
-fn loc_per_entity(graph: &EntityGraph, entity_status: Option<&[Status]>) -> Vec<(usize, usize)> {
-    let removed = |id: EntityId| entity_status.is_some_and(|s| s[id.0] == Status::Removed);
-    let mut loc = vec![(0, 0); graph.entities.len()];
-    let mut stack: Vec<(EntityId, bool)> =
-        graph.entities.iter().filter(|e| e.parent.is_none()).map(|e| (e.id, false)).collect();
-    while let Some((id, children_done)) = stack.pop() {
-        let e = &graph.entities[id.0];
-        if !children_done {
-            stack.push((id, true));
-            stack.extend(e.children.iter().map(|&c| (c, false)));
-            continue;
-        }
-        let current = || e.children.iter().filter(|&&c| removed(id) || !removed(c)).map(|c| loc[c.0]);
-        let own = if e.line_range != (0..0) {
-            e.line_range.end - e.line_range.start + 1
-        } else {
-            current().map(|l| l.0).sum()
-        };
-        let test = if e.is_test { own } else { current().map(|l| l.1).sum() };
-        loc[id.0] = (own, test);
-    }
-    loc
-}
-
 impl From<&Reference> for ReferenceDto {
     fn from(r: &Reference) -> Self {
         ReferenceDto {
@@ -296,7 +262,7 @@ fn plain_graph_dto(
     remap: Option<RemapDto>,
     entity_status: Option<&[Status]>,
 ) -> GraphDto {
-    let loc = loc_per_entity(graph, entity_status);
+    let loc = graph.loc_per_entity(|id| entity_status.is_some_and(|s| s[id.0] == Status::Removed));
     GraphDto {
         root: root_name(graph).to_string(),
         generation,
