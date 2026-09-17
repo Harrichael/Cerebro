@@ -9,7 +9,17 @@ use std::collections::{BTreeMap as Map, BinaryHeap};
 
 use super::id::{NodeId, PortId};
 
-const SEARCH_TIMEOUT: usize = 5000;
+/// Pops allowed per connection. Measured over six zoom levels of this repo:
+/// upstream's 5000 leaves 41% of edges unrouted, 20,000 leaves 32%, and
+/// 200,000 leaves 30% while taking nine times as long.
+///
+/// A larger budget does not simply find better routes -- it finds *worse* ones
+/// that a smaller budget gave up on. Drawn ink over straight-line distance
+/// rises 1.07 -> 1.21 -> 1.48 across those three values, so the edges bought at
+/// the top end are the ones that wander. This is the trade, not a free win, and
+/// the real answer for a crowded level is bundling: fewer edges, not more
+/// search.
+const SEARCH_TIMEOUT: usize = 20_000;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LineType {
@@ -523,11 +533,15 @@ impl<'a> ConnectionsLayout<'a> {
 					let new_cost = current_cost.saturating_add(
 						self.calc_cost(current, ea_nei, start.0, goal.0, ea_conn.1),
 					);
-					if came_from[ea_edge].is_none() || new_cost < cost[ea_edge] {
+					// An `isize::MAX` step is illegal: it crosses a wall. It was
+					// already kept out of the frontier, but recording it as a
+					// predecessor let the backtrace walk through one anyway, so
+					// a drawn route could cut across a node it should go round.
+					if new_cost != isize::MAX
+						&& (came_from[ea_edge].is_none() || new_cost < cost[ea_edge])
+					{
 						let prio = (-new_cost, -Self::heuristic(ea_nei.0, goal.0));
-						if new_cost != isize::MAX {
-							frontier.push((prio, ea_nei));
-						}
+						frontier.push((prio, ea_nei));
 						came_from[ea_edge] = Some(current);
 						cost[ea_edge] = new_cost;
 					}

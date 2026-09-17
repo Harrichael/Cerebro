@@ -205,3 +205,76 @@ pub fn blit(src: &Buffer, dst: &mut Buffer, area: Rect, offset: (u16, u16)) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::placer::{DrawnEdge, Placed};
+    use entity_graph::EntityKind::{File, Folder};
+    use entity_graph::test_support::graph_from_parents;
+
+    /// A zoom level is far taller than it is wide, so an edge running the
+    /// length of one is the ordinary case, not an extreme.
+    ///
+    /// Long *diagonal* routes are a different matter and deliberately not
+    /// asserted here: upstream prices a turn at the squared distance from both
+    /// endpoints, so a mid-canvas turn costs thousands against a step cost of
+    /// two, and no budget worth spending finds one. That is a real limitation
+    /// of the forked cost function, not of this test.
+    #[test]
+    fn an_edge_down_the_length_of_a_tall_canvas_still_routes() {
+        let graph = graph_from_parents(
+            &[("root", Folder, None), ("top.rs", File, Some(0)), ("bottom.rs", File, Some(0))],
+            &[],
+        );
+        let (top, bottom) = (EntityId(1), EntityId(2));
+        let d = Diagram {
+            nodes: vec![
+                Placed { id: top, rect: Rect::new(4, 1, 12, 3), is_box: false },
+                Placed { id: bottom, rect: Rect::new(4, 400, 12, 3), is_box: false },
+            ],
+            edges: vec![DrawnEdge { from: top, to: bottom }],
+            width: 190,
+            height: 410,
+        };
+        let (_, stats) = render(&graph, &d, None);
+        assert_eq!(stats.submitted, 1);
+        assert_eq!(stats.unroutable, 0, "a route 400 rows long should still be found");
+    }
+
+    /// An unroutable edge draws no line, so its arrowhead would be a head with
+    /// no tail -- and would inflate the very count kept to make it visible.
+    #[test]
+    fn an_edge_that_cannot_route_leaves_no_arrowhead() {
+        let graph = graph_from_parents(
+            &[
+                ("root", Folder, None),
+                ("a.rs", File, Some(0)),
+                ("wall.rs", File, Some(0)),
+                ("b.rs", File, Some(0)),
+            ],
+            &[],
+        );
+        let (a, wall, b) = (EntityId(1), EntityId(2), EntityId(3));
+        // `wall` spans the full width with no gutter, so nothing can get from
+        // `a` down to `b`.
+        let d = Diagram {
+            nodes: vec![
+                Placed { id: a, rect: Rect::new(0, 0, 10, 3), is_box: false },
+                Placed { id: wall, rect: Rect::new(0, 3, 10, 3), is_box: false },
+                Placed { id: b, rect: Rect::new(0, 6, 10, 3), is_box: false },
+            ],
+            edges: vec![DrawnEdge { from: a, to: b }],
+            width: 10,
+            height: 9,
+        };
+        let (buf, stats) = render(&graph, &d, None);
+        assert_eq!(stats.submitted, 1);
+        assert_eq!(stats.unroutable, 1, "this edge has nowhere to go; the test proves nothing if it routes");
+        let arrows = (0..buf.area().height)
+            .flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
+            .filter(|&(x, y)| matches!(buf[(x, y)].symbol(), "▼" | "▲"))
+            .count();
+        assert_eq!(arrows, 0, "an edge that never routed still drew its arrowhead");
+    }
+}

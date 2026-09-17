@@ -61,8 +61,12 @@ fn label_width(graph: &EntityGraph, id: EntityId) -> u16 {
     unicode_width::UnicodeWidthStr::width(name).clamp(6, LABEL_MAX) as u16
 }
 
-fn leaf_size(graph: &EntityGraph, id: EntityId) -> (u16, u16) {
-    (label_width(graph, id) + 2, LEAF_H)
+/// Wide enough for its label and for one port per edge touching it. Ports are
+/// spread along the border, so a node narrower than its own degree has to reuse
+/// a coordinate -- and a reused port is an exclusive cell, so the second edge
+/// to claim it simply never routes.
+fn leaf_size(graph: &EntityGraph, id: EntityId, degree: u16) -> (u16, u16) {
+    (label_width(graph, id).max(degree) + 2, LEAF_H)
 }
 
 /// Ancestor chain from the outermost container down to `id` itself.
@@ -204,6 +208,8 @@ struct Ctx<'a> {
     graph: &'a EntityGraph,
     /// Direct children of each container that are actually in view.
     kids: BTreeMap<EntityId, Vec<EntityId>>,
+    /// Edge ends touching each drawn node, which sets how many ports it needs.
+    degree: BTreeMap<EntityId, u16>,
     /// Lifted edges among the direct children of each container.
     inner: BTreeMap<EntityId, Vec<(EntityId, EntityId)>>,
 }
@@ -217,8 +223,9 @@ impl Ctx<'_> {
         avail: u16,
         out: &mut HashMap<EntityId, (u16, u16)>,
     ) -> (u16, u16) {
+        let deg = self.degree.get(&id).copied().unwrap_or(0);
         let Some(kids) = self.kids.get(&id) else {
-            let s = leaf_size(self.graph, id);
+            let s = leaf_size(self.graph, id, deg);
             out.insert(id, s);
             return s;
         };
@@ -240,9 +247,15 @@ impl Ctx<'_> {
             .map(|es| es.iter().filter_map(|(a, b)| Some((*idx.get(a)?, *idx.get(b)?))).collect())
             .unwrap_or_default();
         let (_, w, h) = pack(&sizes, &edges, inner_avail);
-        let label_w = label_width(self.graph, id) + 2;
+        let label_w = label_width(self.graph, id).max(deg) + 2;
+        // Never wider than the room its parent had to give. Without this the
+        // `MIN_INNER_W` floor leaks: once the available width bottoms out,
+        // every further level still wraps its child in four more columns, and
+        // deep nesting walks straight past the viewport -- 40 levels reached
+        // 181 columns against a bound of 100. A box that cannot fit its
+        // contents is the honest outcome; growing the diagram is not.
         let size = (
-            w.max(label_w).saturating_add(2 * (BOX_PAD + 1)),
+            w.max(label_w).saturating_add(2 * (BOX_PAD + 1)).min(avail.max(MIN_INNER_W)),
             h.saturating_add(2 * BOX_PAD + LABEL_H + 1),
         );
         out.insert(id, size);
@@ -334,7 +347,12 @@ pub fn place(graph: &EntityGraph, picture: &Picture, max_w: u16) -> Diagram {
 
     let roots: Vec<EntityId> =
         chains.values().map(|c| c[0]).collect::<BTreeSet<_>>().into_iter().collect();
-    let ctx = Ctx { graph, kids, inner };
+    let mut degree: BTreeMap<EntityId, u16> = BTreeMap::new();
+    for e in &drawn {
+        *degree.entry(e.from).or_default() += 1;
+        *degree.entry(e.to).or_default() += 1;
+    }
+    let ctx = Ctx { graph, kids, inner, degree };
     let mut sizes = HashMap::new();
     for &r in &roots {
         ctx.size(r, max_w, &mut sizes);
@@ -458,6 +476,23 @@ mod tests {
     /// four, so the total crept past the viewport however deep it went.
     #[test]
     fn nesting_does_not_grow_the_diagram_past_the_viewport() {
+        for levels in [3usize, 10, 20, 40] {
+            let names: Vec<String> = (0..levels).map(|i| format!("lvl{i}")).collect();
+            let mut rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> =
+                vec![("root", Folder, None)];
+            for (i, n) in names.iter().enumerate() {
+                rows.push((n.as_str(), Folder, Some(i)));
+            }
+            let files: Vec<String> = (0..6).map(|i| format!("some_file_{i:02}.rs")).collect();
+            rows.extend(files.iter().map(|n| (n.as_str(), File, Some(levels))));
+            let graph = graph_from_parents(&rows, &[]);
+            let d = place(&graph, &fully_zoomed(&graph), 100);
+            assert!(d.width <= 100, "{levels} levels of nesting reached {} columns", d.width);
+        }
+    }
+
+    #[test]
+    fn a_wide_subtree_still_fits_the_viewport() {
         let mut rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> =
             vec![("root", Folder, None)];
         let deep: Vec<String> = (0..6).map(|i| format!("lvl{i}")).collect();

@@ -18,7 +18,22 @@ use graph_tui::placer::{self, Diagram};
 use graph_tui::render::{self, Stats};
 use graph_tui::view::{self, Settings};
 
-const HELP: &str = "q quit  ·  ↑↓←→ scroll  ·  tab/⇧tab select  ·  ↵ zoom in  ·  ⌫ zoom out  ·  t tests  ·  e collapse";
+const HINT: &str = "? keys  ·  ↑↓←→ scroll  ·  tab select  ·  ↵ zoom in  ·  ⌫ zoom out  ·  q quit";
+
+/// The status line has room for a handful of keys, which left most of these
+/// undiscoverable. Everything that does something is listed here.
+const KEYS: &[(&str, &str)] = &[
+    ("↑ ↓ ← →  /  k j h l", "scroll"),
+    ("PgUp PgDn  /  space", "scroll a half screen"),
+    ("Home End  /  g G", "jump to top or bottom"),
+    ("tab ⇧tab  /  n p", "select the next or previous node"),
+    ("↵  /  +", "zoom into the selected node"),
+    ("⌫  /  -", "zoom back out"),
+    ("t", "show or hide test code"),
+    ("e", "one edge per pair, or one per reference kind"),
+    ("?", "this list"),
+    ("q  /  esc  /  ctrl-c", "quit"),
+];
 
 struct App {
     graph: EntityGraph,
@@ -31,6 +46,7 @@ struct App {
     /// Always a drawn leaf, never a box; see `rebuild`.
     selected: Option<EntityId>,
     viewport: Rect,
+    help: bool,
     quit: bool,
 }
 
@@ -47,6 +63,7 @@ impl App {
             offset: (0, 0),
             selected: None,
             viewport,
+            help: false,
             quit: false,
         };
         app.rebuild();
@@ -190,6 +207,10 @@ impl App {
     fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let page = self.viewport.height.max(1) as i32 / 2;
         match code {
+            // While the key list is up it owns the keyboard, so a stray press
+            // dismisses it rather than scrolling something the user cannot see.
+            _ if self.help => self.help = false,
+            KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Up | KeyCode::Char('k') => self.scroll(0, -1),
@@ -236,6 +257,35 @@ fn main() -> Result<()> {
     result
 }
 
+fn draw_keys(frame: &mut ratatui::Frame, area: Rect) {
+    let width = 52.min(area.width);
+    let height = (KEYS.len() as u16 + 2).min(area.height);
+    let panel = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    let lines: Vec<Line> = KEYS
+        .iter()
+        .map(|(keys, what)| {
+            Line::from(vec![
+                Span::styled(format!(" {keys:<20}"), Style::default().fg(Color::Yellow)),
+                Span::raw(format!(" {what}")),
+            ])
+        })
+        .collect();
+    frame.render_widget(ratatui::widgets::Clear, panel);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            ratatui::widgets::Block::bordered()
+                .title(" keys ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        panel,
+    );
+}
+
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.quit {
         terminal.draw(|frame| {
@@ -252,11 +302,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             );
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    HELP,
+                    HINT,
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
                 ))),
                 Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
             );
+            if app.help {
+                draw_keys(frame, area);
+            }
         })?;
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -340,6 +393,25 @@ mod tests {
         assert!(!drawn(&app), "t should hide test code");
         app.key(KeyCode::Char('t'), KeyModifiers::NONE);
         assert!(drawn(&app), "t should bring it back");
+    }
+
+    /// While the key list is up it owns the keyboard: a press meant to dismiss
+    /// it must not also scroll or zoom something the user cannot see.
+    #[test]
+    fn the_key_list_swallows_the_press_that_dismisses_it() {
+        let mut app = app();
+        let (before_offset, before_sel) = (app.offset, app.selected);
+        app.key(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(app.help);
+
+        app.key(KeyCode::Down, KeyModifiers::NONE);
+        assert!(!app.help, "any key should dismiss the list");
+        assert_eq!(app.offset, before_offset, "the dismissing press also scrolled");
+        assert_eq!(app.selected, before_sel);
+
+        app.key(KeyCode::Char('?'), KeyModifiers::NONE);
+        app.key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.quit, "the dismissing press also quit");
     }
 
     /// The selection has to survive a rebuild, or zooming leaves the user with
