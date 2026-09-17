@@ -247,7 +247,18 @@ fn main() -> Result<()> {
     let graph = treesitter_producer::graph_from_path(&root)
         .with_context(|| format!("parsing {}", root.display()))?;
 
-    let mut terminal = ratatui::init();
+    // A panic with the terminal in raw mode leaves the shell unusable, and the
+    // backtrace unreadable on top of the diagram. Restore first, then report.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        hook(info);
+    }));
+
+    let mut terminal = ratatui::try_init().context(
+        "opening the terminal (terraform-graph draws a diagram; it needs a real terminal, \
+         not a pipe or redirect -- use `--example spike` for text output)",
+    )?;
     let size = terminal.size()?;
     let viewport = Rect::new(0, 0, size.width, size.height.saturating_sub(2));
     let mut app = App::new(graph, viewport);
