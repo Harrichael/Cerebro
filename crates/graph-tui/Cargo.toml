@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Terminal 2D graph view of an EntityGraph: per-container layout and orthogonal edge routing."
 
+[[bin]]
+name = "terraform-graph"
+path = "src/main.rs"
+
 [dependencies]
 entity-graph = { workspace = true }
 coalesce = { workspace = true }

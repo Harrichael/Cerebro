@@ -10,8 +10,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use coalesce::Coalesced;
 use entity_graph::{EntityGraph, EntityId};
+
+use crate::view::Picture;
 use ratatui::layout::Rect;
 
 /// Gap between siblings, and the rows between ranks where horizontal runs of
@@ -25,6 +26,10 @@ const LABEL_H: u16 = 1;
 const LEAF_H: u16 = 3;
 /// However deep the nesting, a box always keeps room for one clamped leaf.
 const MIN_INNER_W: u16 = 30;
+/// No label sets the width of the thing holding it. Minified sources really do
+/// produce identifiers tens of thousands of characters long, and one of them
+/// otherwise sizes a box past what the arithmetic below can hold.
+const LABEL_MAX: usize = 28;
 
 #[derive(Debug, Clone)]
 pub struct Placed {
@@ -42,10 +47,6 @@ pub struct DrawnEdge {
     pub to: EntityId,
 }
 
-/// One edge as drawn. `up` marks an edge whose target ranked *above* its
-/// source -- a cycle broken during layering. The renderer has to attach it to
-/// the opposite sides of both nodes; treating it as forward asks the router to
-/// travel against the flow direction, and it simply fails.
 pub struct Diagram {
     pub nodes: Vec<Placed>,
     pub edges: Vec<DrawnEdge>,
@@ -55,10 +56,13 @@ pub struct Diagram {
 
 /// Display width of a leaf's label, bounded so one long name cannot set the
 /// width of a whole rank.
-fn leaf_size(graph: &EntityGraph, id: EntityId) -> (u16, u16) {
+fn label_width(graph: &EntityGraph, id: EntityId) -> u16 {
     let name = graph.get(id).map(|e| e.name.as_str()).unwrap_or("?");
-    let w = unicode_width::UnicodeWidthStr::width(name).clamp(6, 28) as u16;
-    (w + 2, LEAF_H)
+    unicode_width::UnicodeWidthStr::width(name).clamp(6, LABEL_MAX) as u16
+}
+
+fn leaf_size(graph: &EntityGraph, id: EntityId) -> (u16, u16) {
+    (label_width(graph, id) + 2, LEAF_H)
 }
 
 /// Ancestor chain from the outermost container down to `id` itself.
@@ -181,17 +185,17 @@ fn pack(sizes: &[(u16, u16)], edges: &[(usize, usize)], max_w: u16) -> (Vec<(u16
         let (mut x, mut tallest) = (0u16, 0u16);
         for &v in &level {
             let (w, h) = sizes[v];
-            if x > 0 && x + w > max_w {
-                y += tallest + 1;
+            if x > 0 && x.saturating_add(w) > max_w {
+                y = y.saturating_add(tallest).saturating_add(1);
                 x = 0;
                 tallest = 0;
             }
             pos[v] = (x, y);
-            x += w + GAP_X;
+            x = x.saturating_add(w).saturating_add(GAP_X);
             tallest = tallest.max(h);
             widest = widest.max(x.saturating_sub(GAP_X));
         }
-        y += tallest + GAP_Y;
+        y = y.saturating_add(tallest).saturating_add(GAP_Y);
     }
     (pos, widest, y.saturating_sub(GAP_Y))
 }
@@ -236,9 +240,11 @@ impl Ctx<'_> {
             .map(|es| es.iter().filter_map(|(a, b)| Some((*idx.get(a)?, *idx.get(b)?))).collect())
             .unwrap_or_default();
         let (_, w, h) = pack(&sizes, &edges, inner_avail);
-        let name = self.graph.get(id).map(|e| e.name.as_str()).unwrap_or("?");
-        let label_w = unicode_width::UnicodeWidthStr::width(name) as u16 + 2;
-        let size = (w.max(label_w) + 2 * (BOX_PAD + 1), h + 2 * BOX_PAD + LABEL_H + 1);
+        let label_w = label_width(self.graph, id) + 2;
+        let size = (
+            w.max(label_w).saturating_add(2 * (BOX_PAD + 1)),
+            h.saturating_add(2 * BOX_PAD + LABEL_H + 1),
+        );
         out.insert(id, size);
         size
     }
@@ -276,8 +282,8 @@ impl Ctx<'_> {
 }
 
 /// Lay out one zoom level. `max_w` bounds a rank before it wraps.
-pub fn place(graph: &EntityGraph, coalesced: &Coalesced, max_w: u16) -> Diagram {
-    let leaves: BTreeSet<EntityId> = coalesced.leaves.iter().copied().collect();
+pub fn place(graph: &EntityGraph, picture: &Picture, max_w: u16) -> Diagram {
+    let leaves: BTreeSet<EntityId> = picture.nodes.iter().copied().collect();
     let chains: BTreeMap<EntityId, Vec<EntityId>> =
         leaves.iter().map(|&l| (l, lineage(graph, l))).collect();
 
@@ -303,7 +309,7 @@ pub fn place(graph: &EntityGraph, coalesced: &Coalesced, max_w: u16) -> Diagram 
     let mut inner: BTreeMap<EntityId, Vec<(EntityId, EntityId)>> = BTreeMap::new();
     let mut drawn: Vec<DrawnEdge> = Vec::new();
     let mut seen: BTreeSet<(EntityId, EntityId)> = BTreeSet::new();
-    for e in &coalesced.edges {
+    for e in &picture.edges {
         let (Some(fa), Some(ta)) = (chains.get(&e.from), chains.get(&e.to)) else { continue };
         let split = fa.iter().zip(ta).take_while(|(a, b)| a == b).count();
         if split >= fa.len() || split >= ta.len() {
@@ -351,7 +357,7 @@ mod tests {
     use entity_graph::test_support::graph_from_parents;
 
     /// Zoom all the way in, which for these fixtures puts every file in view.
-    fn fully_zoomed(graph: &EntityGraph) -> Coalesced {
+    fn fully_zoomed(graph: &EntityGraph) -> Picture {
         let mut cursor = coalesce::Cursor::new(graph);
         loop {
             let mut moved = false;
@@ -359,7 +365,7 @@ mod tests {
                 moved |= cursor.move_down(leaf, graph);
             }
             if !moved {
-                return cursor.coalesced();
+                return crate::view::apply(graph, &cursor.coalesced(), &Default::default());
             }
         }
     }
@@ -463,6 +469,25 @@ mod tests {
         let graph = graph_from_parents(&rows, &[]);
         let d = place(&graph, &fully_zoomed(&graph), 100);
         assert!(d.width <= 100, "six levels of nesting reached {} columns", d.width);
+    }
+
+    /// Minified vendor sources really do carry identifiers tens of thousands
+    /// of characters long. Before the clamp, one of them sized a box to 30346
+    /// columns and the next zoom overflowed the layout arithmetic outright.
+    #[test]
+    fn an_absurdly_long_name_does_not_size_the_thing_that_holds_it() {
+        let huge = "x".repeat(30_324);
+        let graph = graph_from_parents(
+            &[
+                ("root", Folder, None),
+                ("inner", Folder, Some(0)),
+                (huge.as_str(), File, Some(1)),
+                ("ordinary.rs", File, Some(1)),
+            ],
+            &[],
+        );
+        let d = place(&graph, &fully_zoomed(&graph), 120);
+        assert!(d.width <= 120, "one long label widened the diagram to {}", d.width);
     }
 
     #[test]
