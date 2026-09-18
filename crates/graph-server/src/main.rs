@@ -52,21 +52,28 @@ fn load_graph(scip: Option<&Path>, scip_index: bool, root: &Path) -> Result<Enti
         Some(index) => load_scip(index, root),
         // Not a cached index path: `working_tree_index`'s freshness rule is
         // what makes a rebuild re-index after an edit.
-        None if scip_index => load_scip(&working_tree_index(root)?, root),
+        None if scip_index => load_scip(&working_tree_index(root, Progress::Show)?, root),
         None => load_treesitter(root),
     }
 }
 
 #[cfg(feature = "scip")]
-use scip_producer::index::{base_index, working_tree_index};
+use scip_producer::index::{Progress, base_index, working_tree_index};
+
+/// Stands in for the real one so the `--scip-index` path still type-checks.
+#[cfg(not(feature = "scip"))]
+#[derive(Clone, Copy)]
+enum Progress {
+    Show,
+}
 
 #[cfg(not(feature = "scip"))]
-fn working_tree_index(_root: &Path) -> Result<PathBuf> {
+fn working_tree_index(_root: &Path, _progress: Progress) -> Result<PathBuf> {
     anyhow::bail!("--scip-index requires a binary built with `--features scip`")
 }
 
 #[cfg(not(feature = "scip"))]
-fn base_index(_tree: &Path, _commit: &str, _root: &Path) -> Result<PathBuf> {
+fn base_index(_tree: &Path, _commit: &str, _root: &Path, _progress: Progress) -> Result<PathBuf> {
     anyhow::bail!("--scip-index requires a binary built with `--features scip`")
 }
 
@@ -151,7 +158,7 @@ fn diff_loader(base_ref: &str, root: PathBuf, scip_index: bool) -> Result<Loader
     let commit = base_commit(&root, base_ref)?;
     let (tree, old_root) = extract_base(&root, base_ref, name)?;
     let old = if scip_index {
-        load_scip(&base_index(&old_root, &commit, &root)?, &old_root)?
+        load_scip(&base_index(&old_root, &commit, &root, Progress::Show)?, &old_root)?
     } else {
         load_treesitter(&old_root)?
     };
@@ -162,7 +169,7 @@ fn diff_loader(base_ref: &str, root: PathBuf, scip_index: bool) -> Result<Loader
         // removed files from it, so `tree` must outlive every generation.
         let old_root = tree.path().join(root.file_name().expect("checked above"));
         let new = if scip_index {
-            load_scip(&working_tree_index(&root)?, &root)?
+            load_scip(&working_tree_index(&root, Progress::Show)?, &root)?
         } else {
             load_treesitter(&root)?
         };

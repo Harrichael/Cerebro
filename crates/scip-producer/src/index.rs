@@ -12,6 +12,8 @@ use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result};
 
+pub use crate::indexer::Progress;
+
 fn project_dir(root: &Path) -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     root.hash(&mut h);
@@ -48,32 +50,39 @@ fn is_fresh(index: &Path, root: &Path) -> bool {
     newest_mtime(root).is_none_or(|newest| newest <= indexed)
 }
 
-fn generate(root: &Path, out: &Path) -> Result<()> {
+fn generate(root: &Path, out: &Path, progress: Progress) -> Result<()> {
     let started = Instant::now();
-    let lang = crate::indexer::index_project(root, out)
+    let lang = crate::indexer::index_project(root, out, progress)
         .with_context(|| format!("indexing {}", root.display()))?;
-    println!("Indexed {} with {} in {:.1?} → {}", root.display(), lang.tool(), started.elapsed(), out.display());
+    if progress == Progress::Show {
+        println!("Indexed {} with {} in {:.1?} → {}", root.display(), lang.tool(), started.elapsed(), out.display());
+    }
     Ok(())
 }
 
-pub fn working_tree_index(root: &Path) -> Result<PathBuf> {
+pub fn working_tree_index(root: &Path, progress: Progress) -> Result<PathBuf> {
     let out = project_dir(root).join("index.scip");
-    if is_fresh(&out, root) {
+    if !is_fresh(&out, root) {
+        generate(root, &out, progress)?;
+    } else if progress == Progress::Show {
         println!("Reusing SCIP index {} (newer than every source file)", out.display());
-    } else {
-        generate(root, &out)?;
     }
     Ok(out)
 }
 
 /// `tree` is the extracted base checkout; the index is filed under the
 /// working tree's project dir so it is found again on the next diff.
-pub fn base_index(tree: &Path, commit: &str, working_root: &Path) -> Result<PathBuf> {
+pub fn base_index(
+    tree: &Path,
+    commit: &str,
+    working_root: &Path,
+    progress: Progress,
+) -> Result<PathBuf> {
     let out = project_dir(working_root).join(format!("base-{commit}.scip"));
-    if out.is_file() {
+    if !out.is_file() {
+        generate(tree, &out, progress)?;
+    } else if progress == Progress::Show {
         println!("Reusing SCIP index {} for {commit}", out.display());
-    } else {
-        generate(tree, &out)?;
     }
     Ok(out)
 }

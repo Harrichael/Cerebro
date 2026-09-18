@@ -979,24 +979,42 @@ struct Args {
     path: std::path::PathBuf,
 }
 
-fn load_graph(args: &Args, root: &std::path::Path) -> Result<EntityGraph> {
+/// Reading the tree, and whether anything may be said about it while it
+/// happens. At startup the terminal is still the shell's and an indexer run
+/// worth watching; once the diagram is on screen, a word from the indexer
+/// would be painted over the top of it.
+fn load_graph(args: &Args, root: &std::path::Path, progress: Progress) -> Result<EntityGraph> {
     match (&args.scip, args.treesitter) {
         (Some(index), _) => load_scip(index, root),
         (None, true) => {
-            eprintln!("parsing {}...", root.display());
+            if progress == Progress::Show {
+                eprintln!("parsing {}...", root.display());
+            }
             load_treesitter(root)
         }
         // Not a cached path: the freshness rule inside `working_tree_index` is
         // what makes a stale index get rebuilt rather than silently reused.
-        (None, false) => load_scip(&working_tree_index(root)?, root),
+        (None, false) => load_scip(&working_tree_index(root, progress)?, root),
     }
 }
 
 #[cfg(feature = "scip")]
-use scip_producer::index::working_tree_index;
+use scip_producer::index::{Progress, working_tree_index};
+
+/// Stands in for the real one, so the rest of this file does not have to know
+/// which producers were built in.
+#[cfg(not(feature = "scip"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Progress {
+    Show,
+    Quiet,
+}
 
 #[cfg(not(feature = "scip"))]
-fn working_tree_index(_root: &std::path::Path) -> Result<std::path::PathBuf> {
+fn working_tree_index(
+    _root: &std::path::Path,
+    _progress: Progress,
+) -> Result<std::path::PathBuf> {
     anyhow::bail!("this binary was built without the `scip` feature; pass --treesitter")
 }
 
@@ -1028,13 +1046,14 @@ fn main() -> Result<()> {
         .path
         .canonicalize()
         .with_context(|| format!("resolving {}", args.path.display()))?;
-    let graph = load_graph(&args, &root)?;
+    let graph = load_graph(&args, &root, Progress::Show)?;
     // The same read, ready to be done again when the pane says a file was
     // written. With SCIP that re-indexes, which is why it is never on the
-    // thread that draws.
+    // thread that draws -- and why it is done without a word: the terminal
+    // now has a diagram on it.
     let loader: Loader = {
         let (args, root) = (args, root.clone());
-        std::sync::Arc::new(move || load_graph(&args, &root))
+        std::sync::Arc::new(move || load_graph(&args, &root, Progress::Quiet))
     };
 
     // A panic with the terminal in raw mode leaves the shell unusable, and the

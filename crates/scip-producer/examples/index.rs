@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use scip_producer::indexer::index_project;
+use scip_producer::indexer::{Progress, index_project};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -21,7 +21,7 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join("index.scip"));
     let indexer =
-        index_project(&dir, &out).with_context(|| format!("indexing {}", dir.display()))?;
+        index_project(&dir, &out, Progress::Show).with_context(|| format!("indexing {}", dir.display()))?;
     println!("wrote {} with {}", out.display(), indexer.tool());
     Ok(())
 }

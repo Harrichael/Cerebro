@@ -1,7 +1,9 @@
 //! Run a SCIP indexer over a project tree. The indexer is chosen from the
-//! project's manifest; the tools themselves have to be on PATH, and their
-//! progress output is passed straight through to the terminal because a Rust
-//! index means a build and can take a while.
+//! project's manifest, and the tools themselves have to be on PATH.
+//!
+//! A Rust index means a build and can take a while, so by default the tool's
+//! progress is passed straight through to the terminal. A caller that has
+//! drawn something on that terminal asks for [`Progress::Quiet`] instead.
 
 use std::path::Path;
 use std::process::Command;
@@ -9,6 +11,16 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::dialect::Dialect;
+
+/// Where the indexer's own output goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Straight to the terminal, which is what a command line wants.
+    Show,
+    /// Nowhere. For a caller with a full-screen drawing on that terminal,
+    /// where the tool's progress would be painted over the top of it.
+    Quiet,
+}
 
 pub trait Indexer: Dialect {
     /// Files at the project root that mark a tree as this indexer's. Data
@@ -34,7 +46,7 @@ fn detect(root: &Path) -> Option<&'static dyn Indexer> {
 }
 
 /// Index `root` into `out`, returning which indexer ran.
-pub fn index_project(root: &Path, out: &Path) -> Result<&'static dyn Indexer> {
+pub fn index_project(root: &Path, out: &Path, progress: Progress) -> Result<&'static dyn Indexer> {
     let indexer = detect(root).with_context(|| {
         let manifests: Vec<&str> = crate::indexers::ALL
             .iter()
@@ -47,18 +59,23 @@ pub fn index_project(root: &Path, out: &Path) -> Result<&'static dyn Indexer> {
             root.display()
         )
     })?;
-    run(indexer, root, out)?;
+    run(indexer, root, out, progress)?;
     Ok(indexer)
 }
 
-fn run(indexer: &dyn Indexer, root: &Path, out: &Path) -> Result<()> {
+fn run(indexer: &dyn Indexer, root: &Path, out: &Path, progress: Progress) -> Result<()> {
     // The indexer runs with `root` as its working directory, so a relative
     // output path would land inside the project.
     let out = std::path::absolute(out)?;
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let status = match indexer.command(&out).current_dir(root).status() {
+    let mut command = indexer.command(&out);
+    command.current_dir(root);
+    if progress == Progress::Quiet {
+        command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
+    let status = match command.status() {
         Ok(status) => status,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             bail!("{} is not on PATH ({})", indexer.tool(), indexer.install_hint())
@@ -90,7 +107,7 @@ mod tests {
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
         assert_eq!(detected(dir.path()), Some("rust-analyzer"));
 
-        let err = index_project(&dir.path().join("nowhere"), &dir.path().join("out.scip"))
+        let err = index_project(&dir.path().join("nowhere"), &dir.path().join("out.scip"), Progress::Quiet)
             .err()
             .unwrap();
         assert!(err.to_string().contains("cannot pick a SCIP indexer"), "{err}");
