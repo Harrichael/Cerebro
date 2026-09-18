@@ -31,7 +31,7 @@ const HINT: &str =
     "? keys  ·  scroll pans, ctrl-scroll zooms  ·  ↵ expand  ·  ⌫ collapse  ·  o editor pane  ·  q quit";
 /// The same line, while the pane has the keyboard: every other key on the
 /// board belongs to nvim, so listing them would be a lie.
-const PANE_HINT: &str = "ctrl-w h  back to the diagram  ·  ctrl-w < >  move the divider  ·                           everything else goes to nvim";
+const PANE_HINT: &str = "ctrl-w h  back to the diagram  ·  ctrl-w d  go to what this refers to  ·  ctrl-w < >  move the divider  ·  everything else goes to nvim";
 
 /// Wheel notches are small and terminals are large, so one notch moves more
 /// than one cell. Sideways moves further because columns are narrower than

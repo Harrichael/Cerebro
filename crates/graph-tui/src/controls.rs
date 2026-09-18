@@ -214,6 +214,12 @@ pub fn draw(buf: &mut Buffer, area: Rect, states: impl Fn(Control) -> State) -> 
         let live = state.enabled();
         let y = rect.y + 1 + i as u16;
         let row = Rect::new(rect.x + 1, y, inner_w, 1);
+        // Blanked first. The panel is drawn over the diagram, and a label
+        // shorter than the row left the gap between it and its reading
+        // showing whatever box or edge happened to be underneath.
+        for x in row.x..row.right() {
+            buf[(x, y)].reset();
+        }
         let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
         let (key_style, text_style) = if live {
             (Style::default().fg(Color::Yellow), Style::default().fg(Color::Gray))
@@ -341,5 +347,31 @@ mod tests {
         assert_eq!(p.rect, Rect::default());
         assert_eq!(p.hit(0, 0), None);
         assert!(!p.contains(0, 0), "an absent panel must not swallow clicks");
+    }
+
+    /// The panel sits over the diagram, so it has to be opaque. A label
+    /// shorter than its row used to leave the gap before its reading showing
+    /// whatever box or edge was underneath, which made the panel look like
+    /// the diagram had been drawn through it.
+    #[test]
+    fn the_panel_covers_what_it_is_drawn_over() {
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                buf[(x, y)].set_symbol("━");
+            }
+        }
+        let panel = draw(&mut buf, area, |_| State::Switch(true));
+
+        let mut showing = Vec::new();
+        for y in panel.rect.y..panel.rect.bottom() {
+            for x in panel.rect.x..panel.rect.right() {
+                if buf[(x, y)].symbol() == "━" {
+                    showing.push((x, y));
+                }
+            }
+        }
+        assert!(showing.is_empty(), "the diagram shows through the panel at {showing:?}");
     }
 }
