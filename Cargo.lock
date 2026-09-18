@@ -668,6 +668,7 @@ dependencies = [
  "nvim-ui",
  "ratatui",
  "scip-producer",
+ "tempfile",
  "treesitter-producer",
  "unicode-width",
 ]

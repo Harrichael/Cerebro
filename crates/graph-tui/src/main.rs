@@ -98,6 +98,10 @@ struct App {
     pane_area: Rect,
     /// The size nvim was last told about, so it is only told again on a change.
     pane_was: Rect,
+    /// Where the pane's cursor was when it was last followed. A redraw that
+    /// left it where it was -- most of them, while typing -- is not worth
+    /// asking nvim anything about.
+    pane_cursor: (std::path::PathBuf, usize),
     editor: Option<Editor>,
     focus: Focus,
     /// A `ctrl-w` on the diagram side, waiting for the key that says what it
@@ -109,6 +113,9 @@ struct App {
     trouble: Option<String>,
     /// Handed to the thread that pumps the pane's redraws into the loop.
     inputs: std::sync::mpsc::Sender<Input>,
+    /// Extra arguments for the pane's `nvim`. Nothing, in a real run: the
+    /// whole point is that it is the user's own editor.
+    nvim_args: &'static [&'static str],
 }
 
 /// Who has the keyboard. Nvim wants every key on the board, so this is the
@@ -151,11 +158,13 @@ impl App {
             body: viewport,
             pane_area: Rect::ZERO,
             pane_was: Rect::ZERO,
+            pane_cursor: (std::path::PathBuf::new(), usize::MAX),
             editor: None,
             focus: Focus::Graph,
             pending_window: false,
             trouble: None,
             inputs,
+            nvim_args: &[],
         };
         app.rebuild();
         app
@@ -189,7 +198,7 @@ impl App {
             return;
         }
         let Some(area) = editor::panes(self.body, Some(self.body.width / 2)).1 else { return };
-        match Editor::open(&self.root, area) {
+        match Editor::open(&self.root, area, self.nvim_args) {
             Ok((editor, events)) => {
                 // Nvim redraws on its own schedule, so its events have to
                 // reach the same loop the keyboard does or the pane would
@@ -206,6 +215,9 @@ impl App {
                 self.pane_area = area;
                 self.focus = Focus::Pane;
                 self.trouble = None;
+                if let Some(selected) = self.selected {
+                    self.show_in_pane(selected);
+                }
             }
             Err(e) => self.trouble = Some(format!("{e:#}")),
         }
@@ -299,6 +311,18 @@ impl App {
     /// mouse click come through here so they cannot disagree about what
     /// selecting means.
     fn select(&mut self, id: EntityId) {
+        self.select_and_tell(id, true);
+    }
+
+    /// Selecting because the pane's own cursor moved there. The pane is not
+    /// told back: it is already showing the thing, and jumping it to the top
+    /// of whatever the cursor happened to land in would move the text out
+    /// from under the reader.
+    fn select_from_pane(&mut self, id: EntityId) {
+        self.select_and_tell(id, false);
+    }
+
+    fn select_and_tell(&mut self, id: EntityId, tell_pane: bool) {
         if self.selected == Some(id) {
             return;
         }
@@ -308,6 +332,75 @@ impl App {
             self.camera.reveal(rect);
         }
         self.redraw_selection(was);
+        if tell_pane {
+            self.show_in_pane(id);
+        }
+    }
+
+    /// Open what was selected in the pane, at its first line, with its extent
+    /// tinted. A folder has no file to open, so the pane is left showing
+    /// whatever it was showing.
+    fn show_in_pane(&mut self, id: EntityId) {
+        let Some(editor) = self.editor.as_ref() else { return };
+        let (Some(rel), Some(entity)) = (self.graph.file_path(id), self.graph.get(id)) else {
+            return;
+        };
+        // A whole file's extent is every line of it, and tinting all of them
+        // says nothing; only what sits inside one gets marked.
+        let range = match entity.kind == entity_graph::EntityKind::File {
+            true => None,
+            false => Some(entity.line_range.clone()),
+        };
+        // Checked, not assumed: a graph can name a file that is not there --
+        // built from a stale index, or from a tree that has moved on -- and
+        // `:edit` on a directory hands the pane netrw instead of the code.
+        let path = self.root.join(rel);
+        if !path.is_file() {
+            return;
+        }
+        editor.show(&path, entity.line_range.start, range);
+    }
+
+    /// Follow the pane's cursor: whatever the diagram is drawing for the
+    /// entity it is sitting in becomes the selection.
+    ///
+    /// The entity itself is often not drawn -- the graph is collapsed above
+    /// it -- so this selects the nearest drawn leaf standing for it, the same
+    /// rule a click in the browser's code pane follows.
+    fn follow_pane_cursor(&mut self) {
+        let Some(editor) = self.editor.as_ref() else { return };
+        // The line first, because it comes free with the redraw. Asking nvim
+        // which file it is showing is a round trip, and a redraw that left
+        // the cursor on the line it was on -- every keystroke of typing a
+        // word -- is not worth one. The cost is that switching file and
+        // landing on the same line is not noticed until the next move.
+        let line = editor.nvim().viewport().curline;
+        if line == self.pane_cursor.1 {
+            return;
+        }
+        self.pane_cursor.1 = line;
+        let Some(path) = editor.current_file() else { return };
+        self.pane_cursor.0 = path.clone();
+        let Ok(rel) = path.strip_prefix(&self.root) else { return };
+        let Some(file) = self.graph.file_at_path(rel) else { return };
+        let Some(inner) = self.graph.innermost_at(file, line) else { return };
+        if let Some(drawn) = self.drawn_leaf_for(inner) {
+            self.select_from_pane(drawn);
+        }
+    }
+
+    /// The drawn leaf standing for `id`: itself if it is one, else the
+    /// nearest ancestor that is. `None` when nothing on its line is drawn --
+    /// hidden, or scoped away.
+    fn drawn_leaf_for(&self, id: EntityId) -> Option<EntityId> {
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            if self.diagram.nodes.iter().any(|n| !n.is_box && n.id == c) {
+                return Some(c);
+            }
+            cur = self.graph.get(c).and_then(|e| e.parent);
+        }
+        None
     }
 
     /// Move the selection through the drawn leaves in reading order, and scroll
@@ -670,8 +763,10 @@ impl App {
             Input::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => self.press(key),
             Input::Term(Event::Mouse(ev)) if is_gesture(ev.kind) => self.mouse(ev),
             Input::Term(_) => {}
-            // The pane repainted, which the next frame picks up on its own.
-            Input::Pane(nvim_ui::Event::Redraw) => {}
+            // The pane repainted. The frame after this picks that up on its
+            // own; what needs doing here is noticing whether its cursor moved
+            // into a different piece of the graph.
+            Input::Pane(nvim_ui::Event::Redraw) => self.follow_pane_cursor(),
             Input::Pane(nvim_ui::Event::Exited) => {
                 self.editor = None;
                 self.pane_area = Rect::ZERO;
@@ -1351,6 +1446,9 @@ mod tests {
         let mut app = app();
         // Wide enough that both panes are worth drawing.
         app.body = Rect::new(0, 0, 120, 20);
+        // Not the user's own nvim: a config that opens a dashboard, or makes
+        // a fresh buffer unmodifiable, would decide whether these pass.
+        app.nvim_args = &["--clean"];
         app.control(Control::Editor);
         app
     }
@@ -1479,6 +1577,92 @@ mod tests {
         let leaked = (0..pane.y.max(20))
             .any(|y| row_text(y, 0, pane.x).contains("MARKER"));
         assert!(!leaked, "the pane painted over the diagram");
+    }
+
+    /// A real tree, parsed the way cerebro parses one, so the line numbers
+    /// under test are the producer's rather than a fixture author's guess.
+    fn project(source: &str) -> (tempfile::TempDir, EntityGraph) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("lib.rs"), source).expect("writing the source");
+        let graph = treesitter_producer::graph_from_path(dir.path()).expect("parsing");
+        (dir, graph)
+    }
+
+    fn expanded_app(dir: &tempfile::TempDir, graph: EntityGraph) -> App {
+        let (inputs, queue) = std::sync::mpsc::channel();
+        std::mem::forget(queue);
+        let mut app = App::new(graph, Rect::new(0, 0, 120, 20), dir.path().to_path_buf(), inputs);
+        for _ in 0..4 {
+            for leaf in app.cursor.coalesced().leaves {
+                app.cursor.move_down(leaf, &app.graph);
+            }
+        }
+        app.rebuild();
+        app.body = Rect::new(0, 0, 120, 20);
+        app.nvim_args = &["--clean"];
+        app
+    }
+
+    fn entity_named<'a>(app: &'a App, name: &str) -> &'a entity_graph::Entity {
+        app.graph.entities.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("no {name}"))
+    }
+
+    fn settle(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// The pane and the diagram are two views of one thing, and this is the
+    /// wire between them: choosing a node in the diagram opens its code, and
+    /// moving through the code chooses the node.
+    #[test]
+    fn the_diagram_and_the_pane_follow_each_other() {
+        if !have_nvim() {
+            return;
+        }
+        let (dir, graph) = project("fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    let y = 2;\n}\n");
+        let mut app = expanded_app(&dir, graph);
+        let (alpha, beta) = (entity_named(&app, "alpha").id, entity_named(&app, "beta").id);
+        let beta_line = entity_named(&app, "beta").line_range.start;
+        app.control(Control::Editor);
+
+        // Diagram to pane: selecting opens the file at what was selected.
+        app.select(alpha);
+        let editor = app.editor.as_ref().expect("the pane is open");
+        assert_eq!(
+            editor.current_file().as_deref().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("lib.rs")),
+            "selecting a function did not open its file"
+        );
+        assert!(
+            settle(|| app.editor.as_ref().is_some_and(|e| {
+                e.nvim().viewport().curline == entity_named(&app, "alpha").line_range.start
+            })),
+            "the pane did not land on alpha"
+        );
+
+        // Pane to diagram: moving the cursor into the other function picks it.
+        app.editor
+            .as_ref()
+            .expect("still open")
+            .nvim()
+            .call(
+                "nvim_win_set_cursor",
+                vec![0.into(), nvim_ui::Value::Array(vec![(beta_line as i64 + 1).into(), 0.into()])],
+            )
+            .expect("moving the cursor");
+        assert!(
+            settle(|| app.editor.as_ref().is_some_and(|e| e.nvim().viewport().curline == beta_line)),
+            "nvim never reported the new cursor line"
+        );
+        app.follow_pane_cursor();
+        assert_eq!(app.selected, Some(beta), "the diagram did not follow the cursor");
     }
 
     /// The panel exists so the mouse can do what the keys do. A click on a

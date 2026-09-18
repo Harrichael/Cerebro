@@ -35,3 +35,4 @@ coalesce = { workspace = true }
 # The examples build a graph from a real tree whatever features the binary
 # was built with.
 treesitter-producer = { workspace = true }
+tempfile = { workspace = true }

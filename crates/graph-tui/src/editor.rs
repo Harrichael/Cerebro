@@ -20,7 +20,7 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 
-use nvim_ui::{Mode, Nvim};
+use nvim_ui::{Mode, Nvim, Value};
 
 /// Neither pane is worth having below these. A body too narrow for both is
 /// given entirely to whichever one the user is looking at.
@@ -43,6 +43,9 @@ pub enum Handled {
 
 pub struct Editor {
     nvim: Nvim,
+    /// The extmark namespace the range tint is drawn in, so showing a new
+    /// entity can clear the last one without touching anyone else's marks.
+    marks: i64,
     /// Columns of the body the pane takes, before any clamping. Held as a
     /// wish rather than a measurement so a window that grows and shrinks
     /// again comes back to the split the user chose.
@@ -52,9 +55,86 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn open(root: &Path, area: Rect) -> Result<(Editor, Receiver<nvim_ui::Event>)> {
-        let (nvim, events) = Nvim::spawn(root, (area.width.max(1), area.height.max(1)), &[])?;
-        Ok((Editor { nvim, width: area.width, pending: false }, events))
+    /// `args` reaches the `nvim` command. Empty is the point of the whole
+    /// exercise -- the user's own editor, their config, their colours -- and
+    /// a test passes `--clean` so it is not at the mercy of them.
+    pub fn open(
+        root: &Path,
+        area: Rect,
+        args: &[&str],
+    ) -> Result<(Editor, Receiver<nvim_ui::Event>)> {
+        let (nvim, events) = Nvim::spawn(root, (area.width.max(1), area.height.max(1)), args)?;
+        let marks = nvim
+            .call("nvim_create_namespace", vec!["cerebro".into()])
+            .ok()
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        // A group of its own, linked to something the colourscheme already
+        // sets, so the tint suits whatever the user is using and they can
+        // still override this one thing without touching CursorLine.
+        let _ = nvim.call(
+            "nvim_set_hl",
+            vec![
+                0.into(),
+                "CerebroRange".into(),
+                Value::Map(vec![("link".into(), "CursorLine".into()), ("default".into(), true.into())]),
+            ],
+        );
+        Ok((Editor { nvim, marks, width: area.width, pending: false }, events))
+    }
+
+    /// Put `file` on screen at `line`, with `range` tinted as the extent of
+    /// whatever the diagram has selected.
+    ///
+    /// Does not take focus: showing you where something is, is not the same
+    /// as asking you to go and edit it.
+    pub fn show(&self, file: &Path, line: usize, range: Option<std::ops::Range<usize>>) {
+        // Through `nvim_cmd` with the path as an argument rather than
+        // `:edit <path>` as text: a path is not vim syntax, and one with a
+        // space or a `%` in it would be read as something else entirely.
+        let edited = self.nvim.call(
+            "nvim_cmd",
+            vec![
+                Value::Map(vec![
+                    ("cmd".into(), "edit".into()),
+                    ("args".into(), Value::Array(vec![file.to_string_lossy().as_ref().into()])),
+                ]),
+                Value::Map(vec![]),
+            ],
+        );
+        if edited.is_err() {
+            return;
+        }
+        // Nvim counts rows from one and columns from zero, in the same call.
+        let _ = self.nvim.call(
+            "nvim_win_set_cursor",
+            vec![0.into(), Value::Array(vec![(line as i64 + 1).into(), 0.into()])],
+        );
+        let _ = self.nvim.call("nvim_command", vec!["normal! zz".into()]);
+        self.tint(range);
+    }
+
+    fn tint(&self, range: Option<std::ops::Range<usize>>) {
+        let _ = self.nvim.call(
+            "nvim_buf_clear_namespace",
+            vec![0.into(), self.marks.into(), 0.into(), (-1).into()],
+        );
+        let Some(range) = range else { return };
+        // `line_range` is inclusive at both ends; an extmark's is not.
+        let _ = self.nvim.call(
+            "nvim_buf_set_extmark",
+            vec![
+                0.into(),
+                self.marks.into(),
+                (range.start as i64).into(),
+                0.into(),
+                Value::Map(vec![
+                    ("end_row".into(), (range.end as i64 + 1).into()),
+                    ("hl_group".into(), "CerebroRange".into()),
+                    ("hl_eol".into(), true.into()),
+                ]),
+            ],
+        );
     }
 
     pub fn nvim(&self) -> &Nvim {
@@ -125,6 +205,14 @@ impl Editor {
             // No answer means no split worth honouring.
             _ => false,
         }
+    }
+
+    /// The file the pane is showing, absolute, or `None` for a buffer with no
+    /// file behind it.
+    pub fn current_file(&self) -> Option<std::path::PathBuf> {
+        let name = self.nvim.eval("expand('%:p')").ok()?;
+        let name = name.as_str().filter(|n| !n.is_empty())?;
+        Some(std::path::PathBuf::from(name))
     }
 
     pub fn mouse(&self, kind: MouseEventKind, column: u16, row: u16, area: Rect) {

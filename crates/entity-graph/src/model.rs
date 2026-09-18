@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Unique identifier for an entity within the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -144,6 +144,38 @@ impl EntityGraph {
         Some(cur.id)
     }
 
+    /// The File entity whose source is `rel`, a path relative to the project
+    /// root -- the same shape [`Self::file_path`] hands back.
+    pub fn file_at_path(&self, rel: &Path) -> Option<EntityId> {
+        self.entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::File)
+            .find(|e| self.file_path(e.id).as_deref() == Some(rel))
+            .map(|e| e.id)
+    }
+
+    /// The smallest entity inside `file` holding `line`, or the file itself
+    /// when nothing smaller does. Lines are 0-indexed, and `line_range` is
+    /// inclusive at both ends -- a one-line function is `n..n`, which is why
+    /// `0..0` is how "no range at all" is spelled and is skipped here.
+    pub fn innermost_at(&self, file: EntityId, line: usize) -> Option<EntityId> {
+        let file = self.get(file).filter(|e| e.kind == EntityKind::File)?;
+        let mut best = (file.id, usize::MAX);
+        let mut stack: Vec<EntityId> = file.children.clone();
+        while let Some(id) = stack.pop() {
+            let Some(e) = self.get(id) else { continue };
+            stack.extend(e.children.iter().copied());
+            if e.line_range == (0..0) || line < e.line_range.start || line > e.line_range.end {
+                continue;
+            }
+            let span = e.line_range.end - e.line_range.start;
+            if span < best.1 {
+                best = (id, span);
+            }
+        }
+        Some(best.0)
+    }
+
     /// `(loc, test_loc)` per entity, indexed by [`EntityId`]. `loc` is the
     /// inclusive line range when the entity has one, otherwise (folders) the
     /// sum over its children; `test_loc` is how much of that is test code, so
@@ -176,5 +208,55 @@ impl EntityGraph {
             loc[id.0] = (own, test);
         }
         loc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::graph_from_parents;
+
+    /// Ranges are inclusive at both ends, so a line at the very last line of
+    /// a function is still inside it; and the *smallest* thing holding a line
+    /// is the answer, since a function sits inside a class sits inside a file.
+    #[test]
+    fn the_smallest_thing_holding_a_line_is_what_is_at_it() {
+        let rows = [
+            ("proj", EntityKind::Folder, None),
+            ("lib.rs", EntityKind::File, Some(0)),
+            ("Widget", EntityKind::Class, Some(1)),
+            ("draw", EntityKind::Function, Some(2)),
+            ("helper", EntityKind::Function, Some(1)),
+        ];
+        let mut graph = graph_from_parents(&rows, &[]);
+        let ranges = [(1, 0..40), (2, 5..20), (3, 8..12), (4, 30..35)];
+        for (id, range) in ranges {
+            graph.entities[id].line_range = range;
+        }
+        let file = EntityId(1);
+        let at = |line| graph.innermost_at(file, line).expect("the file is a file");
+
+        assert_eq!(at(9), EntityId(3), "inside the method");
+        assert_eq!(at(12), EntityId(3), "its last line is still inside it");
+        assert_eq!(at(13), EntityId(2), "past it, but still inside the class");
+        assert_eq!(at(30), EntityId(4));
+        assert_eq!(at(0), file, "nothing smaller holds it, so the file does");
+        assert_eq!(graph.innermost_at(EntityId(0), 9), None, "a folder is not a file");
+    }
+
+    /// Paths come back relative to the project root, and go back in the same
+    /// shape -- a pane that opened a file has to be able to say which entity
+    /// it was.
+    #[test]
+    fn a_file_is_found_by_the_path_it_reports() {
+        let rows = [
+            ("proj", EntityKind::Folder, None),
+            ("src", EntityKind::Folder, Some(0)),
+            ("main.rs", EntityKind::File, Some(1)),
+        ];
+        let graph = graph_from_parents(&rows, &[]);
+        let rel = graph.file_path(EntityId(2)).expect("a file has a path");
+        assert_eq!(graph.file_at_path(&rel), Some(EntityId(2)));
+        assert_eq!(graph.file_at_path(Path::new("nowhere.rs")), None);
     }
 }
