@@ -530,14 +530,74 @@ fn is_under(graph: &EntityGraph, id: EntityId, ancestor: EntityId) -> bool {
     false
 }
 
+/// Where the graph comes from. SCIP by default: its references are resolved
+/// by a real indexer rather than by name, and everything the diagram draws is
+/// only as true as they are.
+#[derive(clap::Parser)]
+#[command(name = "cerebro", about = "Terminal 2D graph view of a code entity graph")]
+struct Args {
+    /// Build from this SCIP index instead of generating one.
+    #[arg(long, value_name = "index.scip")]
+    scip: Option<std::path::PathBuf>,
+    /// Parse with tree-sitter instead. Starts in under a second on any tree,
+    /// at the cost of references matched by name.
+    #[arg(long, conflicts_with = "scip")]
+    treesitter: bool,
+    /// Project root (or single file) to load.
+    #[arg(default_value = ".")]
+    path: std::path::PathBuf,
+}
+
+fn load_graph(args: &Args, root: &std::path::Path) -> Result<EntityGraph> {
+    match (&args.scip, args.treesitter) {
+        (Some(index), _) => load_scip(index, root),
+        (None, true) => {
+            eprintln!("parsing {}...", root.display());
+            load_treesitter(root)
+        }
+        // Not a cached path: the freshness rule inside `working_tree_index` is
+        // what makes a stale index get rebuilt rather than silently reused.
+        (None, false) => load_scip(&working_tree_index(root)?, root),
+    }
+}
+
+#[cfg(feature = "scip")]
+use scip_producer::index::working_tree_index;
+
+#[cfg(not(feature = "scip"))]
+fn working_tree_index(_root: &std::path::Path) -> Result<std::path::PathBuf> {
+    anyhow::bail!("this binary was built without the `scip` feature; pass --treesitter")
+}
+
+#[cfg(feature = "scip")]
+fn load_scip(index: &std::path::Path, root: &std::path::Path) -> Result<EntityGraph> {
+    scip_producer::graph_from_index(index, root)
+        .with_context(|| format!("loading SCIP index {}", index.display()))
+}
+
+#[cfg(not(feature = "scip"))]
+fn load_scip(_index: &std::path::Path, _root: &std::path::Path) -> Result<EntityGraph> {
+    anyhow::bail!("--scip requires a binary built with `--features scip`")
+}
+
+#[cfg(feature = "treesitter")]
+fn load_treesitter(root: &std::path::Path) -> Result<EntityGraph> {
+    treesitter_producer::graph_from_path(root)
+        .with_context(|| format!("parsing {}", root.display()))
+}
+
+#[cfg(not(feature = "treesitter"))]
+fn load_treesitter(_root: &std::path::Path) -> Result<EntityGraph> {
+    anyhow::bail!("this binary was built without the `treesitter` feature")
+}
+
 fn main() -> Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| ".".into());
-    let root = std::path::Path::new(&path)
+    let args = <Args as clap::Parser>::parse();
+    let root = args
+        .path
         .canonicalize()
-        .with_context(|| format!("resolving {path}"))?;
-    eprintln!("parsing {}...", root.display());
-    let graph = treesitter_producer::graph_from_path(&root)
-        .with_context(|| format!("parsing {}", root.display()))?;
+        .with_context(|| format!("resolving {}", args.path.display()))?;
+    let graph = load_graph(&args, &root)?;
 
     // A panic with the terminal in raw mode leaves the shell unusable, and the
     // backtrace unreadable on top of the diagram. Restore first, then report.

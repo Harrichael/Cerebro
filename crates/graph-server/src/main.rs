@@ -2,8 +2,6 @@
 
 mod dto;
 mod handlers;
-#[cfg(feature = "scip")]
-mod index;
 mod reload;
 mod text_index;
 mod watch;
@@ -60,7 +58,7 @@ fn load_graph(scip: Option<&Path>, scip_index: bool, root: &Path) -> Result<Enti
 }
 
 #[cfg(feature = "scip")]
-use index::{base_index, working_tree_index};
+use scip_producer::index::{base_index, working_tree_index};
 
 #[cfg(not(feature = "scip"))]
 fn working_tree_index(_root: &Path) -> Result<PathBuf> {

@@ -11,10 +11,12 @@
 //! machine) to convert line/column positions into byte offsets.
 //!
 //! [`indexer`] runs the external indexer for a project so callers do not
-//! have to know which tool produces the index for which language.
+//! have to know which tool produces the index for which language; [`index`]
+//! keeps the result on disk and rebuilds it only once it has gone stale.
 
 mod build;
 mod dialect;
+pub mod index;
 pub mod indexer;
 mod indexers;
 mod source;

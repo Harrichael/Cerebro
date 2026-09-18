@@ -9,11 +9,21 @@ description = "Terminal 2D graph view of an EntityGraph: per-container layout an
 name = "cerebro"
 path = "src/main.rs"
 
+[features]
+# SCIP is the default because its references are exact: the graph's edges,
+# and the go-to they drive, are only as good as the producer that resolved
+# them. Tree-sitter stays for trees no indexer can handle.
+default = ["scip", "treesitter"]
+scip = ["dep:scip-producer"]
+treesitter = ["dep:treesitter-producer"]
+
 [dependencies]
 entity-graph = { workspace = true }
 coalesce = { workspace = true }
-treesitter-producer = { workspace = true }
+treesitter-producer = { workspace = true, optional = true }
+scip-producer = { workspace = true, optional = true }
 anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
 unicode-width = "0.2"
 log = "0.4"
@@ -21,3 +31,6 @@ log = "0.4"
 [dev-dependencies]
 entity-graph = { workspace = true, features = ["test-support"] }
 coalesce = { workspace = true }
+# The examples build a graph from a real tree whatever features the binary
+# was built with.
+treesitter-producer = { workspace = true }

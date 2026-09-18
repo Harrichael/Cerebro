@@ -1,8 +1,10 @@
-//! Generated SCIP indexes live under the system temp dir, one folder per
-//! project, so `--scip-index` never writes into the tree it is indexing.
+//! Keep a generated SCIP index on disk for a project, so callers can ask for
+//! one by path and not care whether it had to be built.
 //!
-//! A working-tree index is reused while it is newer than every source file;
-//! a base-tree index is keyed by commit and therefore never goes stale.
+//! Indexes live under the system temp dir, one folder per project, so
+//! indexing never writes into the tree it is indexing. A working-tree index
+//! is reused while it is newer than every source file; a base-tree index is
+//! keyed by commit and therefore never goes stale.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -14,7 +16,7 @@ fn project_dir(root: &Path) -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     root.hash(&mut h);
     let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    std::env::temp_dir().join("graph-server").join(format!("{name}-{:016x}", h.finish()))
+    std::env::temp_dir().join("scip-index").join(format!("{name}-{:016x}", h.finish()))
 }
 
 /// Newest modification time under `root`, ignoring what indexers and package
@@ -48,7 +50,7 @@ fn is_fresh(index: &Path, root: &Path) -> bool {
 
 fn generate(root: &Path, out: &Path) -> Result<()> {
     let started = Instant::now();
-    let lang = scip_producer::indexer::index_project(root, out)
+    let lang = crate::indexer::index_project(root, out)
         .with_context(|| format!("indexing {}", root.display()))?;
     println!("Indexed {} with {} in {:.1?} → {}", root.display(), lang.tool(), started.elapsed(), out.display());
     Ok(())
@@ -109,7 +111,7 @@ mod tests {
         set_time(&root.join(".hidden"), 0);
         assert!(is_fresh(&index, &root), "build output and dotfiles are not sources");
 
-        assert!(project_dir(&root).starts_with(std::env::temp_dir().join("graph-server")));
+        assert!(project_dir(&root).starts_with(std::env::temp_dir().join("scip-index")));
         assert_ne!(project_dir(&root), project_dir(&dir.path().join("other")));
     }
 }

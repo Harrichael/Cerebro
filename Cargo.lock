@@ -661,10 +661,12 @@ name = "graph-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "coalesce",
  "entity-graph",
  "log",
  "ratatui",
+ "scip-producer",
  "treesitter-producer",
  "unicode-width",
 ]
