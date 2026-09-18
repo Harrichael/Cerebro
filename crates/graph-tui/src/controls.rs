@@ -15,6 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
+    Editor,
     Zoom,
     Tests,
     OnePerPair,
@@ -27,6 +28,7 @@ pub enum Control {
 
 /// Key, control, label — in the order they are drawn.
 const ROWS: &[(char, Control, &str)] = &[
+    ('o', Control::Editor, "editor pane"),
     ('z', Control::Zoom, "zoom"),
     ('t', Control::Tests, "tests"),
     ('e', Control::OnePerPair, "one edge/pair"),

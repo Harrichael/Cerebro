@@ -28,6 +28,7 @@
 //! syntax and no colour, and nothing says why.
 
 mod grid;
+mod keys;
 mod rpc;
 
 use std::path::Path;
@@ -38,9 +39,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use rmpv::Value;
-
 pub use grid::{Mode, Viewport};
+/// Re-exported so a caller can name what `call` hands back without taking a
+/// msgpack dependency of its own.
+pub use rmpv::Value;
 
 /// Why a caller is being woken up.
 pub enum Event {
@@ -136,6 +138,14 @@ impl Nvim {
         let _ = self.client.send("nvim_input", vec![keys.into()]);
     }
 
+    /// Type one key press at nvim. Presses it has no name for are dropped
+    /// rather than guessed at.
+    pub fn key(&self, key: ratatui::crossterm::event::KeyEvent) {
+        if let Some(keys) = keys::notation(key) {
+            self.input(&keys);
+        }
+    }
+
     /// `button` is one of left/right/middle/wheel/move, `action` press/drag/
     /// release for a button or up/down/left/right for the wheel, and
     /// `modifiers` a string like `"c"` or `"cs"`. Row and column are cells
@@ -154,7 +164,14 @@ impl Nvim {
         );
     }
 
-    /// Ask nvim something and wait for the answer.
+    /// Evaluate a vimscript expression and wait for the answer. The short
+    /// way to ask nvim about itself -- `eval("winnr()")`, `eval("&filetype")`
+    /// -- without the caller having to know what msgpack is.
+    pub fn eval(&self, expression: &str) -> Result<Value> {
+        self.call("nvim_eval", vec![expression.into()])
+    }
+
+    /// Any API method, for the ones `eval` cannot reach.
     pub fn call(&self, method: &str, params: Vec<Value>) -> Result<Value> {
         self.client.call(method, params)
     }

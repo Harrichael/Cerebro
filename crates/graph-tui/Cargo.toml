@@ -22,6 +22,7 @@ entity-graph = { workspace = true }
 coalesce = { workspace = true }
 treesitter-producer = { workspace = true, optional = true }
 scip-producer = { workspace = true, optional = true }
+nvim-ui = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"

@@ -15,6 +15,7 @@ entity-graph = { path = "crates/entity-graph" }
 treesitter-producer = { path = "crates/treesitter-producer" }
 scip-producer = { path = "crates/scip-producer" }
 coalesce = { path = "crates/coalesce" }
+nvim-ui = { path = "crates/nvim-ui" }
 graph-diff = { path = "crates/graph-diff" }
 tempfile = "3"
 notify = "8"

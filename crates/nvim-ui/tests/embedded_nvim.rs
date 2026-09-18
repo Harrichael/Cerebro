@@ -151,16 +151,34 @@ fn nvim_still_answers_after_nobody_is_listening_for_redraws() {
     drop(events);
     nvim.input("ggIzzz <Esc>");
 
+    // Typing is fire and forget, so this asks until the answer catches up
+    // rather than once -- every turn of which is another question answered
+    // with nobody listening, which is the point.
     let answered = std::thread::spawn(move || {
-        let line = nvim.call("nvim_get_current_line", vec![]);
-        (line, nvim.row(0))
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let line = nvim
+                .call("nvim_get_current_line", vec![])
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned));
+            // Both, because they arrive separately: the buffer changes when
+            // the keys are consumed, the screen when nvim next repaints.
+            let row = nvim.row(0);
+            if (line.as_deref() == Some("zzz one") && row.starts_with("zzz one"))
+                || Instant::now() > deadline
+            {
+                return (line, row);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     });
-    let deadline = Instant::now() + PATIENCE;
+    // A `call` that hung would leave this thread running for ever.
+    let deadline = Instant::now() + PATIENCE + PATIENCE;
     while !answered.is_finished() {
         assert!(Instant::now() < deadline, "nvim stopped answering once nothing was listening");
         std::thread::sleep(Duration::from_millis(20));
     }
     let (line, row) = answered.join().expect("the asking thread");
-    assert_eq!(line.expect("an answer").as_str(), Some("zzz one"));
+    assert_eq!(line.as_deref(), Some("zzz one"), "nvim answered, but never with the edit");
     assert!(row.starts_with("zzz one"), "the screen went stale; row 0 was {row:?}");
 }

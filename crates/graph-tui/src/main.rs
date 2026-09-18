@@ -13,13 +13,14 @@ use ratatui::crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use graph_tui::camera::Camera;
 use graph_tui::controls::{self, Control, NodeAction, State};
+use graph_tui::editor::{self, Editor, Handled};
 use graph_tui::label::Labels;
 use graph_tui::placer::{self, Diagram};
 use graph_tui::render::{self, Stats};
@@ -27,7 +28,10 @@ use graph_tui::view::{self, Settings};
 use graph_tui::zoom::Zoom;
 
 const HINT: &str =
-    "? keys  ·  scroll pans, ⇧scroll sideways, ctrl-scroll zooms  ·  ↵ expand  ·  ⌫ collapse  ·  q quit";
+    "? keys  ·  scroll pans, ctrl-scroll zooms  ·  ↵ expand  ·  ⌫ collapse  ·  o editor pane  ·  q quit";
+/// The same line, while the pane has the keyboard: every other key on the
+/// board belongs to nvim, so listing them would be a lie.
+const PANE_HINT: &str = "ctrl-w h  back to the diagram  ·  ctrl-w < >  move the divider  ·                           everything else goes to nvim";
 
 /// Wheel notches are small and terminals are large, so one notch moves more
 /// than one cell. Sideways moves further because columns are narrower than
@@ -49,9 +53,21 @@ const KEYS: &[(&str, &str)] = &[
     ("↵  /  +", "expand the selected node into its children"),
     ("⌫  /  -", "collapse it back into its parent"),
     ("ctrl-scroll  /  z", "zoom: draw the same graph larger or smaller"),
+    ("o  /  ctrl-w l", "open the editor pane, and go to it"),
+    ("ctrl-w h", "from the pane, back to the diagram"),
+    ("ctrl-w < >", "move the divider between them"),
     ("?", "this list"),
     ("q  /  esc  /  ctrl-c", "quit"),
 ];
+
+/// Everything the loop waits on. Two producers -- the terminal and, once it
+/// is open, the pane -- because nvim redraws when it is ready rather than
+/// when a key is pressed, and a loop blocked on the keyboard would show a
+/// screen from before the last thing nvim did.
+enum Input {
+    Term(Event),
+    Pane(nvim_ui::Event),
+}
 
 struct App {
     graph: EntityGraph,
@@ -73,10 +89,43 @@ struct App {
     panel: controls::Panel,
     help: bool,
     quit: bool,
+
+    /// The tree the diagram is of, for the pane to open files out of.
+    root: std::path::PathBuf,
+    /// Both panes' share of the screen, as of the last frame.
+    body: Rect,
+    /// Where the pane landed last frame, so a click can be aimed at it.
+    pane_area: Rect,
+    /// The size nvim was last told about, so it is only told again on a change.
+    pane_was: Rect,
+    editor: Option<Editor>,
+    focus: Focus,
+    /// A `ctrl-w` on the diagram side, waiting for the key that says what it
+    /// meant.
+    pending_window: bool,
+    /// What went wrong that the user needs telling about -- no nvim on PATH,
+    /// unsaved work standing in the way of a quit. Cleared by the next thing
+    /// that works.
+    trouble: Option<String>,
+    /// Handed to the thread that pumps the pane's redraws into the loop.
+    inputs: std::sync::mpsc::Sender<Input>,
+}
+
+/// Who has the keyboard. Nvim wants every key on the board, so this is the
+/// whole of the arbitration: whoever is in focus gets all of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Graph,
+    Pane,
 }
 
 impl App {
-    fn new(graph: EntityGraph, viewport: Rect) -> Self {
+    fn new(
+        graph: EntityGraph,
+        viewport: Rect,
+        root: std::path::PathBuf,
+        inputs: std::sync::mpsc::Sender<Input>,
+    ) -> Self {
         let cursor = coalesce::Cursor::new(&graph);
         let mut app = App {
             graph,
@@ -98,6 +147,15 @@ impl App {
             panel: controls::Panel::default(),
             help: false,
             quit: false,
+            root,
+            body: viewport,
+            pane_area: Rect::ZERO,
+            pane_was: Rect::ZERO,
+            editor: None,
+            focus: Focus::Graph,
+            pending_window: false,
+            trouble: None,
+            inputs,
         };
         app.rebuild();
         app
@@ -121,6 +179,65 @@ impl App {
             // Hidden, scoped away, or filtered out: there is nothing of it
             // left to inherit, so start over.
             .or_else(|| leaves.first().map(|(id, _)| *id))
+    }
+
+    /// Start a Neovim beside the diagram, and give it the keyboard -- asking
+    /// for the pane is asking to be in it.
+    fn open_editor(&mut self) {
+        if self.editor.is_some() {
+            self.focus = Focus::Pane;
+            return;
+        }
+        let Some(area) = editor::panes(self.body, Some(self.body.width / 2)).1 else { return };
+        match Editor::open(&self.root, area) {
+            Ok((editor, events)) => {
+                // Nvim redraws on its own schedule, so its events have to
+                // reach the same loop the keyboard does or the pane would
+                // only repaint when something else happened to wake us.
+                let inputs = self.inputs.clone();
+                std::thread::spawn(move || {
+                    for event in events {
+                        if inputs.send(Input::Pane(event)).is_err() {
+                            return;
+                        }
+                    }
+                });
+                self.editor = Some(editor);
+                self.pane_area = area;
+                self.focus = Focus::Pane;
+                self.trouble = None;
+            }
+            Err(e) => self.trouble = Some(format!("{e:#}")),
+        }
+    }
+
+    /// Closing kills the Neovim, so work it is holding would go with it.
+    fn close_editor(&mut self) {
+        if let Some(unsaved) = self.unsaved() {
+            self.trouble = Some(unsaved);
+            return;
+        }
+        self.editor = None;
+        self.pane_area = Rect::ZERO;
+        self.focus = Focus::Graph;
+        self.trouble = None;
+    }
+
+    /// What to say instead of throwing away a buffer somebody is part way
+    /// through, or `None` when there is nothing to lose.
+    fn unsaved(&self) -> Option<String> {
+        let editor = self.editor.as_ref()?;
+        let modified = editor
+            .nvim()
+            .eval("len(filter(getbufinfo({'bufloaded': 1}), 'v:val.changed'))")
+            .ok()
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        match modified {
+            0 => None,
+            1 => Some("the pane has an unwritten buffer; :w it, or :bd! it".into()),
+            n => Some(format!("the pane has {n} unwritten buffers; write them, or :bd! them")),
+        }
     }
 
     fn labels(&self) -> Labels<'_> {
@@ -215,6 +332,7 @@ impl App {
     /// them so a control cannot say "on" and do nothing.
     fn state(&self, c: Control) -> State {
         match c {
+            Control::Editor => State::Switch(self.editor.is_some()),
             Control::Zoom => State::Level(self.zoom.name()),
             Control::Tests => State::Switch(self.settings.show_tests),
             Control::OnePerPair => State::Switch(self.settings.one_per_pair),
@@ -234,6 +352,13 @@ impl App {
 
     fn control(&mut self, c: Control) {
         match c {
+            Control::Editor => {
+                match self.editor.is_some() {
+                    true => self.close_editor(),
+                    false => self.open_editor(),
+                }
+                return;
+            }
             // Cycling is its own path: it holds the middle of the screen, and
             // the shared `rebuild` at the end of this function would re-centre.
             Control::Zoom => {
@@ -361,6 +486,17 @@ impl App {
             self.help = false;
             return;
         }
+        // Pointing at something says which pane you mean, so the mouse needs
+        // no focus rule of its own -- it sets one.
+        if self.editor.is_some() && self.pane_area.contains(Position::new(ev.column, ev.row)) {
+            self.focus = Focus::Pane;
+            let area = self.pane_area;
+            if let Some(editor) = self.editor.as_ref() {
+                editor.mouse(ev.kind, ev.column, ev.row, area);
+            }
+            return;
+        }
+        self.focus = Focus::Graph;
         let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
         match ev.kind {
@@ -480,7 +616,85 @@ impl App {
                 Style::default().fg(Color::Cyan),
             ));
         }
+        if self.editor.is_some() {
+            spans.push(Span::styled(
+                match self.focus {
+                    Focus::Pane => "· pane ".to_string(),
+                    Focus::Graph => "· pane (ctrl-w l) ".to_string(),
+                },
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        // Last, and in red: it is the one thing on this line the user has to
+        // do something about.
+        if let Some(trouble) = &self.trouble {
+            spans.push(Span::styled(
+                format!("· {trouble} "),
+                Style::default().fg(Color::Red),
+            ));
+        }
         Line::from(spans)
+    }
+
+    /// A press, to whoever has the keyboard. The pane is a whole editor, so
+    /// when it is in focus everything goes to it except the `ctrl-w` that
+    /// leads back out; see `editor`.
+    fn press(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        if self.focus == Focus::Pane {
+            match self.editor.as_mut().map(|e| e.key(key)) {
+                Some(Handled::Pane) => {}
+                Some(Handled::GiveUpFocus) => self.focus = Focus::Graph,
+                Some(Handled::Resize(by)) => self.widen_pane(by),
+                // Focus without a pane to hold it; put it back.
+                None => self.focus = Focus::Graph,
+            }
+            return;
+        }
+        if std::mem::take(&mut self.pending_window) {
+            match key.code {
+                KeyCode::Char('l') => self.open_editor(),
+                KeyCode::Char('<') => self.widen_pane(-4),
+                KeyCode::Char('>') => self.widen_pane(4),
+                _ => {}
+            }
+            return;
+        }
+        self.key(key.code, key.modifiers);
+    }
+
+    fn take(&mut self, input: Input) {
+        match input {
+            // Mouse capture reports every twitch of the pointer. Those change
+            // nothing, so they neither reach the app -- where any event
+            // dismisses the key list -- nor cost a repaint.
+            Input::Term(Event::Key(key)) if key.kind == KeyEventKind::Press => self.press(key),
+            Input::Term(Event::Mouse(ev)) if is_gesture(ev.kind) => self.mouse(ev),
+            Input::Term(_) => {}
+            // The pane repainted, which the next frame picks up on its own.
+            Input::Pane(nvim_ui::Event::Redraw) => {}
+            Input::Pane(nvim_ui::Event::Exited) => {
+                self.editor = None;
+                self.pane_area = Rect::ZERO;
+                self.focus = Focus::Graph;
+                self.trouble = Some("the pane's nvim exited".into());
+            }
+        }
+    }
+
+    fn widen_pane(&mut self, by: i32) {
+        if let Some(editor) = self.editor.as_mut() {
+            let width = (i32::from(editor.width()) + by).clamp(0, i32::from(u16::MAX));
+            editor.set_width(width as u16);
+        }
+    }
+
+    /// Quitting takes the pane's Neovim with it, so it is refused while that
+    /// would lose something.
+    fn leave(&mut self) {
+        match self.unsaved() {
+            Some(unsaved) => self.trouble = Some(unsaved),
+            None => self.quit = true,
+        }
     }
 
     fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -490,8 +704,11 @@ impl App {
             // dismisses it rather than scrolling something the user cannot see.
             _ if self.help => self.help = false,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => self.leave(),
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.leave(),
+            KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+                self.pending_window = true
+            }
             KeyCode::Up | KeyCode::Char('k') => self.camera.scroll(0, -1),
             KeyCode::Down | KeyCode::Char('j') => self.camera.scroll(0, 1),
             KeyCode::Left | KeyCode::Char('h') => self.camera.scroll(-4, 0),
@@ -620,8 +837,22 @@ fn main() -> Result<()> {
         execute!(std::io::stdout(), EnableMouseCapture).context("turning on mouse reporting")?;
         let size = terminal.size()?;
         let viewport = Rect::new(0, 0, size.width, size.height.saturating_sub(2));
-        let mut app = App::new(graph, viewport);
-        run(&mut terminal, &mut app)
+
+        let (inputs, queue) = std::sync::mpsc::channel();
+        // The keyboard is read off the main thread so the main thread can wait
+        // on the pane as well. It is never joined: it is parked inside
+        // `event::read` on a terminal that only closes when the process does.
+        let keyboard = inputs.clone();
+        std::thread::spawn(move || {
+            while let Ok(event) = event::read() {
+                if keyboard.send(Input::Term(event)).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut app = App::new(graph, viewport, root, inputs);
+        run(&mut terminal, &mut app, &queue)
     })();
     restore();
     result
@@ -682,59 +913,91 @@ fn is_gesture(kind: MouseEventKind) -> bool {
     )
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    inputs: &std::sync::mpsc::Receiver<Input>,
+) -> Result<()> {
+    draw(terminal, app)?;
     while !app.quit {
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
-            if body != app.camera.viewport {
-                // Only width feeds the layout -- it is what a rank wraps
-                // against. A change in height just shows more of the same
-                // diagram, and re-routing every edge to learn that would cost
-                // seconds on every drag of a window corner.
-                let relaid = body.width != app.camera.viewport.width;
-                app.camera.resize(body);
-                if relaid {
-                    app.rebuild();
-                }
-            }
-            render::blit(&app.canvas, frame.buffer_mut(), body, app.camera.offset);
-            // Drawn after the diagram and remembered, because the click that
-            // works a switch arrives after the frame that showed it.
-            app.panel = controls::draw(frame.buffer_mut(), body, |c| app.state(c));
-            frame.render_widget(
-                Paragraph::new(app.status()),
-                Rect::new(area.x, area.bottom().saturating_sub(2), area.width, 1),
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    HINT,
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
-                ))),
-                Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-            );
-            if app.help {
-                draw_keys(frame, area);
-            }
-        })?;
-        // Mouse capture reports every twitch of the pointer. Those change
-        // nothing, so they neither reach the app -- where any event dismisses
-        // the key list -- nor cost a full redraw of the frame.
-        loop {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    app.key(key.code, key.modifiers);
-                    break;
-                }
-                Event::Mouse(ev) if is_gesture(ev.kind) => {
-                    app.mouse(ev);
-                    break;
-                }
-                Event::Resize(..) => break,
-                _ => {}
-            }
+        // One input at least, then whatever else is already queued behind it,
+        // and one frame for the lot. A burst of nvim redraws costs one repaint
+        // rather than one each.
+        app.take(inputs.recv().context("the input channel closed")?);
+        while let Ok(next) = inputs.try_recv() {
+            app.take(next);
+        }
+        if !app.quit {
+            draw(terminal, app)?;
         }
     }
+    Ok(())
+}
+
+/// Generic over the backend so a test can draw a frame and read it back.
+fn draw<B>(terminal: &mut ratatui::Terminal<B>, app: &mut App) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
+    terminal.draw(|frame| {
+        let area = frame.area();
+        app.body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
+        let (graph, pane) = editor::panes(app.body, app.editor.as_ref().map(Editor::width));
+
+        if graph.width > 0 && graph != app.camera.viewport {
+            // Only width feeds the layout -- it is what a rank wraps
+            // against. A change in height just shows more of the same
+            // diagram, and re-routing every edge to learn that would cost
+            // seconds on every drag of a window corner.
+            let relaid = graph.width != app.camera.viewport.width;
+            app.camera.resize(graph);
+            if relaid {
+                app.rebuild();
+            }
+        }
+        if graph.width > 0 {
+            render::blit(&app.canvas, frame.buffer_mut(), graph, app.camera.offset);
+            // Drawn after the diagram and remembered, because the click that
+            // works a switch arrives after the frame that showed it.
+            app.panel = controls::draw(frame.buffer_mut(), graph, |c| app.state(c));
+        } else {
+            app.panel = controls::Panel::default();
+        }
+
+        app.pane_area = pane.unwrap_or(Rect::ZERO);
+        if let (Some(editor), Some(pane)) = (app.editor.as_ref(), pane) {
+            // Only on a change: nvim redraws its whole screen for a resize,
+            // and asking every frame would have it doing that forever.
+            if pane != app.pane_was {
+                editor.resize(pane);
+            }
+            editor.draw(frame.buffer_mut(), pane);
+            if app.focus == Focus::Pane {
+                let (x, y) = editor.cursor(pane);
+                frame.set_cursor_position((x, y));
+            }
+        }
+        app.pane_was = app.pane_area;
+
+        frame.render_widget(
+            Paragraph::new(app.status()),
+            Rect::new(area.x, area.bottom().saturating_sub(2), area.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                match app.focus {
+                    Focus::Pane => PANE_HINT,
+                    Focus::Graph => HINT,
+                },
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ))),
+            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+        );
+        if app.help {
+            draw_keys(frame, area);
+        }
+    })?;
     Ok(())
 }
 
@@ -761,8 +1024,19 @@ mod tests {
         graph
     }
 
+    /// An app with no pane and nowhere for its inputs to go. Every test here
+    /// drives it by calling straight into it, so the channel is only there to
+    /// be owned.
+    fn app_with(graph: EntityGraph, viewport: Rect) -> App {
+        let (inputs, queue) = std::sync::mpsc::channel();
+        // Kept alive for as long as the app is, so a send cannot fail and
+        // change what is under test.
+        std::mem::forget(queue);
+        App::new(graph, viewport, ".".into(), inputs)
+    }
+
     fn app() -> App {
-        let mut app = App::new(fixture(), Rect::new(0, 0, 60, 20));
+        let mut app = app_with(fixture(), Rect::new(0, 0, 60, 20));
         // Expand to the files; the root alone has nothing to scroll or select.
         for _ in 0..2 {
             for leaf in app.cursor.coalesced().leaves {
@@ -805,7 +1079,7 @@ mod tests {
     /// and the shifted wheel arrive as the same event kind.
     #[test]
     fn shift_scrolling_pans_sideways_instead_of_down() {
-        let mut app = App::new(fixture(), Rect::new(0, 0, 30, 20));
+        let mut app = app_with(fixture(), Rect::new(0, 0, 30, 20));
         let before = app.camera.offset;
         app.mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::SHIFT, 0, 0));
         assert_eq!(app.camera.offset.1, before.1, "a sideways pan moved the view down");
@@ -873,7 +1147,7 @@ mod tests {
             ("c.rs", File, Some(2)),
         ];
         let graph = graph_from_parents(&rows, &[(3, 4, Call)]);
-        let mut app = App::new(graph, Rect::new(0, 0, 80, 24));
+        let mut app = app_with(graph, Rect::new(0, 0, 80, 24));
         app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> left, right
 
         // Pick the *second* folder, so "the first leaf in the diagram" and
@@ -934,7 +1208,7 @@ mod tests {
             ("a.rs", File, Some(1)),
             ("b.rs", File, Some(2)),
         ];
-        let mut app = App::new(graph_from_parents(&rows, &[(3, 4, Call)]), Rect::new(0, 0, 80, 24));
+        let mut app = app_with(graph_from_parents(&rows, &[(3, 4, Call)]), Rect::new(0, 0, 80, 24));
         app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> left, right
 
         let leaf = app.diagram.nodes.iter().find(|n| !n.is_box).expect("a leaf is drawn");
@@ -1004,15 +1278,8 @@ mod tests {
     fn draw_panel(app: &mut App) {
         let area = app.camera.viewport;
         let mut buf = ratatui::buffer::Buffer::empty(area);
-        let states: Vec<(Control, State)> =
-            [Control::Zoom, Control::Tests, Control::OnePerPair, Control::Edges,
-             Control::Hide, Control::Scope, Control::ShowAll, Control::CollapseAll]
-                .into_iter()
-                .map(|c| (c, app.state(c)))
-                .collect();
-        app.panel = controls::draw(&mut buf, area, |c| {
-            states.iter().find(|(k, _)| *k == c).expect("every control has a state").1
-        });
+        let panel = controls::draw(&mut buf, area, |c| app.state(c));
+        app.panel = panel;
     }
 
     fn drawn(app: &App, id: EntityId) -> bool {
@@ -1062,19 +1329,176 @@ mod tests {
         assert_eq!(before, after, "turning edges off moved the nodes");
     }
 
+    fn press(code: KeyCode, mods: KeyModifiers) -> ratatui::crossterm::event::KeyEvent {
+        ratatui::crossterm::event::KeyEvent::new(code, mods)
+    }
+
+    /// The pane is a real Neovim; without one there is nothing to test.
+    fn have_nvim() -> bool {
+        let found = std::process::Command::new("nvim")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !found {
+            eprintln!("skipping: nvim is not on PATH");
+        }
+        found
+    }
+
+    fn app_with_pane() -> App {
+        let mut app = app();
+        // Wide enough that both panes are worth drawing.
+        app.body = Rect::new(0, 0, 120, 20);
+        app.control(Control::Editor);
+        app
+    }
+
+    /// The whole of the arbitration. Nvim wants `q`, `tab`, `z` and the rest
+    /// for itself, so while the pane has the keyboard the diagram must not
+    /// act on any of them -- and `ctrl-w h`, the move the user's fingers
+    /// already know, must hand it back.
+    #[test]
+    fn the_pane_takes_the_whole_keyboard_and_ctrl_w_h_gives_it_back() {
+        if !have_nvim() {
+            return;
+        }
+        let mut app = app_with_pane();
+        assert_eq!(app.focus, Focus::Pane, "opening the pane goes to it");
+        let selected = app.selected;
+
+        app.press(press(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.quit, "q quit the viewer while the user was typing in nvim");
+        app.press(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.selected, selected, "tab moved the diagram's selection");
+
+        app.press(press(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.press(press(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Graph);
+
+        app.press(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_ne!(app.selected, selected, "the diagram never got the keyboard back");
+    }
+
+    /// Pointing at a pane says which one you mean, so the mouse sets focus
+    /// rather than obeying it.
+    #[test]
+    fn clicking_a_pane_is_how_you_choose_it() {
+        if !have_nvim() {
+            return;
+        }
+        let mut app = app_with_pane();
+        app.pane_area = Rect::new(60, 0, 60, 20);
+
+        app.mouse(wheel(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE, 10, 5));
+        assert_eq!(app.focus, Focus::Graph, "a click on the diagram did not take focus");
+
+        app.mouse(wheel(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE, 80, 5));
+        assert_eq!(app.focus, Focus::Pane, "a click on the pane did not take focus");
+    }
+
+    /// Closing the pane kills its Neovim, and quitting closes the pane. Doing
+    /// either while a buffer is part-written would throw the work away with
+    /// no way to get it back.
+    #[test]
+    fn work_left_unwritten_in_the_pane_stops_the_viewer_closing_it() {
+        if !have_nvim() {
+            return;
+        }
+        let mut app = app_with_pane();
+        let nvim = app.editor.as_ref().expect("the pane opened").nvim();
+        // Through a call rather than by typing: this has to have landed
+        // before the question is asked.
+        nvim.call(
+            "nvim_buf_set_lines",
+            vec![0.into(), 0.into(), (-1).into(), false.into(),
+                 nvim_ui::Value::Array(vec!["half a thought".into()])],
+        )
+        .expect("editing the buffer");
+
+        app.leave();
+        assert!(!app.quit, "quitting threw away an unwritten buffer");
+        assert!(app.trouble.as_deref().unwrap_or_default().contains("unwritten"));
+
+        app.control(Control::Editor);
+        assert!(app.editor.is_some(), "closing threw away an unwritten buffer");
+
+        // Once it is no longer precious, both go through.
+        app.editor
+            .as_ref()
+            .expect("still open")
+            .nvim()
+            .call("nvim_command", vec!["setlocal nomodified".into()])
+            .expect("marking it saved");
+        app.control(Control::Editor);
+        assert!(app.editor.is_none(), "the pane would not close");
+        app.leave();
+        assert!(app.quit);
+    }
+
+    /// End to end: what nvim draws on its own screen has to arrive in the
+    /// frame, in the pane's columns and nowhere else.
+    #[test]
+    fn what_nvim_draws_lands_in_the_panes_half_of_the_frame() {
+        if !have_nvim() {
+            return;
+        }
+        let mut app = app_with_pane();
+        {
+            let nvim = app.editor.as_ref().expect("the pane opened").nvim();
+            nvim.call(
+                "nvim_buf_set_lines",
+                vec![0.into(), 0.into(), (-1).into(), false.into(),
+                     nvim_ui::Value::Array(vec!["MARKER".into()])],
+            )
+            .expect("putting text in the buffer");
+            // The grid is kept current whether or not anything is listening
+            // for redraws, so polling it is enough.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !(0..20).any(|y| nvim.row(y).contains("MARKER")) {
+                assert!(std::time::Instant::now() < deadline, "nvim never drew it");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 22)).expect("terminal");
+        draw(&mut terminal, &mut app).expect("drawing a frame");
+
+        let buf = terminal.backend().buffer();
+        let row_text = |y: u16, from: u16, to: u16| -> String {
+            (from..to).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        };
+        let pane = app.pane_area;
+        assert!(pane.width > 0, "the pane got no columns");
+        let found = (pane.y..pane.bottom())
+            .any(|y| row_text(y, pane.x, pane.right()).contains("MARKER"));
+        assert!(found, "the pane drew nothing; its first row was {:?}", row_text(pane.y, pane.x, pane.right()));
+
+        let leaked = (0..pane.y.max(20))
+            .any(|y| row_text(y, 0, pane.x).contains("MARKER"));
+        assert!(!leaked, "the pane painted over the diagram");
+    }
+
     /// The panel exists so the mouse can do what the keys do. A click on a
     /// switch has to reach the same code the key reaches.
     #[test]
     fn clicking_a_switch_does_what_its_key_does() {
         let mut app = app();
         draw_panel(&mut app);
-        let row = app.panel.rect.y + 1 + 1; // zoom, then tests
+        // Found, not counted to: a switch added above this one should not
+        // quietly make the test click a different switch.
+        let column = app.panel.rect.x + 2;
+        let row = (app.panel.rect.y..app.panel.rect.bottom())
+            .find(|&y| app.panel.hit(column, y) == Some(Control::Tests))
+            .expect("the tests switch is on the panel");
         assert!(app.settings.show_tests);
 
         app.mouse(wheel(
             MouseEventKind::Down(MouseButton::Left),
             KeyModifiers::NONE,
-            app.panel.rect.x + 2,
+            column,
             row,
         ));
         assert!(!app.settings.show_tests, "clicking the tests switch did nothing");
@@ -1118,7 +1542,7 @@ mod tests {
     /// with nothing selected and no way back.
     #[test]
     fn expanding_and_collapsing_keep_something_selected() {
-        let mut app = App::new(fixture(), Rect::new(0, 0, 60, 20));
+        let mut app = app_with(fixture(), Rect::new(0, 0, 60, 20));
         assert!(app.selected.is_some());
         for _ in 0..3 {
             app.key(KeyCode::Enter, KeyModifiers::NONE);

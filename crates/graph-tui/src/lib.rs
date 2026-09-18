@@ -2,6 +2,7 @@
 
 pub mod camera;
 pub mod controls;
+pub mod editor;
 pub mod label;
 pub mod placer;
 pub mod render;

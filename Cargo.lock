@@ -665,6 +665,7 @@ dependencies = [
  "coalesce",
  "entity-graph",
  "log",
+ "nvim-ui",
  "ratatui",
  "scip-producer",
  "treesitter-producer",
