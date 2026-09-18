@@ -28,6 +28,8 @@ const PANE_MIN: u16 = 40;
 const GRAPH_MIN: u16 = 24;
 /// Columns one `ctrl-w <` or `ctrl-w >` moves the divider.
 const RESIZE_STEP: i32 = 4;
+/// What nvim calls back with after `:w`.
+pub const WROTE: &str = "cerebro_wrote";
 
 /// What the pane did with a key press, for the app that handed it over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,20 @@ impl Editor {
                 Value::Map(vec![("link".into(), "CursorLine".into()), ("default".into(), true.into())]),
             ],
         );
+        // Nvim says when a file is written; the alternative is watching the
+        // filesystem for edits we already know about.
+        if let Ok(channel) = nvim.channel() {
+            let _ = nvim.call(
+                "nvim_create_autocmd",
+                vec![
+                    "BufWritePost".into(),
+                    Value::Map(vec![(
+                        "command".into(),
+                        format!("call rpcnotify({channel}, '{WROTE}', expand('<afile>:p'))").into(),
+                    )]),
+                ],
+            );
+        }
         Ok((Editor { nvim, marks, width: area.width, pending: false }, events))
     }
 

@@ -35,7 +35,7 @@ fn settle(events: &Receiver<Event>, mut done: impl FnMut() -> bool) -> bool {
             return false;
         }
         match events.recv_timeout(left) {
-            Ok(Event::Redraw) => {}
+            Ok(Event::Redraw) | Ok(Event::Notify(..)) => {}
             Ok(Event::Exited) | Err(_) => return done(),
         }
     }

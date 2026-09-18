@@ -218,14 +218,14 @@ impl Server {
             Loaded::Graph(g) => g,
             Loaded::Diff { diff, .. } => &diff.graph,
         };
-        let map = reload::id_map(&old.graph, new_graph);
+        let map = coalesce::migrate::id_map(&old.graph, new_graph);
         let next = Snapshot::build(old.generation + 1, loaded, &self.root, Some(&map));
 
         // Held from reading the old leaves through the swap: an expansion served
         // in between would be acknowledged and then silently thrown away.
         let old_cursor = old.cursor.lock().unwrap();
         *next.cursor.lock().unwrap() =
-            reload::migrate_cursor(&old.graph, &old_cursor.leaves, &map, &next.graph);
+            coalesce::migrate::migrate_cursor(&old.graph, &old_cursor.leaves, &map, &next.graph);
         // Recorded before the swap, so no request ever sees the new
         // generation without the step that leads to it.
         self.remaps.lock().unwrap().push(old.generation, map);

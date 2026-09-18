@@ -16,6 +16,7 @@
 //! for event in events {
 //!     match event {
 //!         Event::Redraw => { /* nvim.draw(frame.buffer_mut(), area) */ }
+//!         Event::Notify(method, args) => println!("nvim said {method}: {args:?}"),
 //!         Event::Exited => break,
 //!     }
 //! }
@@ -50,6 +51,9 @@ pub enum Event {
     Redraw,
     /// Nvim is gone -- `:qa`, a crash, or a kill. Nothing else will arrive.
     Exited,
+    /// Something inside nvim called `rpcnotify` -- an autocmd, a mapping, a
+    /// plugin. The method is whatever it named.
+    Notify(String, Vec<Value>),
 }
 
 pub struct Nvim {
@@ -90,6 +94,9 @@ impl Nvim {
             let mut listening = true;
             for notification in notifications {
                 if notification.method != "redraw" {
+                    if tx.send(Event::Notify(notification.method, notification.params)).is_err() {
+                        listening = false;
+                    }
                     continue;
                 }
                 let mut grid = applying.lock().expect("grid");
@@ -162,6 +169,15 @@ impl Nvim {
                 col.into(),
             ],
         );
+    }
+
+    /// The channel nvim knows this UI by, for `rpcnotify` to send back on.
+    pub fn channel(&self) -> Result<i64> {
+        let info = self.call("nvim_get_api_info", vec![])?;
+        info.as_array()
+            .and_then(|parts| parts.first())
+            .and_then(Value::as_i64)
+            .context("nvim_get_api_info gave no channel id")
     }
 
     /// Evaluate a vimscript expression and wait for the answer. The short

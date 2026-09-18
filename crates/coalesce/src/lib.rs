@@ -8,6 +8,7 @@
 //! anything else is a consumer's concern.
 
 mod cursor;
+pub mod migrate;
 
 pub use cursor::*;
 

@@ -68,6 +68,34 @@ const KEYS: &[(&str, &str)] = &[
 enum Input {
     Term(Event),
     Pane(nvim_ui::Event),
+    /// A rebuild finished. `Err` is what to tell the user instead.
+    Reloaded(Box<Result<EntityGraph>>),
+}
+
+/// How long the rebuild thread waits for the writing to stop. Saving three
+/// files in a row is one edit, and re-indexing after each of them would mean
+/// waiting three times for an answer only the last one can give.
+const QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Re-read the tree the same way it was read at startup.
+type Loader = std::sync::Arc<dyn Fn() -> Result<EntityGraph> + Send + Sync>;
+
+/// The one thread that reloads. Requests only wake it; it decides when the
+/// writing has stopped, does the work off the main thread -- with SCIP that
+/// is an indexer run, not a parse -- and posts the result back into the loop.
+fn spawn_reloader(loader: Loader, inputs: std::sync::mpsc::Sender<Input>) -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while rx.recv().is_ok() {
+            // Everything that arrives during the quiet window, and during the
+            // reload itself, folds into this one.
+            while rx.recv_timeout(QUIET).is_ok() {}
+            if inputs.send(Input::Reloaded(Box::new(loader()))).is_err() {
+                return;
+            }
+        }
+    });
+    tx
 }
 
 struct App {
@@ -117,6 +145,12 @@ struct App {
     /// Extra arguments for the pane's `nvim`. Nothing, in a real run: the
     /// whole point is that it is the user's own editor.
     nvim_args: &'static [&'static str],
+    /// Nudged when a file is written; the thread on the other end decides
+    /// when the writing has stopped.
+    reload: std::sync::mpsc::Sender<()>,
+    /// A reload is in flight. Worth saying, because with SCIP it is an
+    /// indexer run rather than a parse.
+    reloading: bool,
 }
 
 /// Who has the keyboard. Nvim wants every key on the board, so this is the
@@ -133,8 +167,10 @@ impl App {
         viewport: Rect,
         root: std::path::PathBuf,
         inputs: std::sync::mpsc::Sender<Input>,
+        loader: Loader,
     ) -> Self {
         let cursor = coalesce::Cursor::new(&graph);
+        let reload = spawn_reloader(loader, inputs.clone());
         let mut app = App {
             graph,
             cursor,
@@ -166,9 +202,37 @@ impl App {
             trouble: None,
             inputs,
             nvim_args: &[],
+            reload,
+            reloading: false,
         };
         app.rebuild();
         app
+    }
+
+    /// Swap in a freshly read graph, carrying everything that named the old
+    /// one across: the expansion, the selection, what was hidden and what was
+    /// scoped to. Ids are arena indices, so all of them changed.
+    fn reloaded(&mut self, result: Result<EntityGraph>) {
+        self.reloading = false;
+        let new = match result {
+            Ok(graph) => graph,
+            Err(e) => {
+                self.trouble = Some(format!("{e:#}"));
+                return;
+            }
+        };
+        let old = std::mem::replace(&mut self.graph, new);
+        let map = coalesce::migrate::id_map(&old, &self.graph);
+        let moved = |id: EntityId| map.get(id.0).copied().flatten();
+        self.cursor =
+            coalesce::migrate::migrate_cursor(&old, &self.cursor.leaves, &map, &self.graph);
+        self.selected = self.selected.and_then(moved);
+        self.settings.hidden = self.settings.hidden.iter().copied().filter_map(moved).collect();
+        self.settings.scope = self.settings.scope.and_then(moved);
+        // The pane is showing a file, not an id, so it needs nothing said to
+        // it -- but what the diagram thinks its cursor is in has changed.
+        self.pane_cursor = (std::path::PathBuf::new(), usize::MAX);
+        self.rebuild();
     }
 
     /// Where the selection goes when the node holding it stops being a leaf.
@@ -750,6 +814,12 @@ impl App {
                 Style::default().fg(Color::Cyan),
             ));
         }
+        if self.reloading {
+            spans.push(Span::styled(
+                "· re-reading the tree ".to_string(),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         if self.editor.is_some() {
             spans.push(Span::styled(
                 match self.focus {
@@ -809,6 +879,13 @@ impl App {
             // own; what needs doing here is noticing whether its cursor moved
             // into a different piece of the graph.
             Input::Pane(nvim_ui::Event::Redraw) => self.follow_pane_cursor(),
+            Input::Pane(nvim_ui::Event::Notify(method, _)) if method == editor::WROTE => {
+                self.reloading = true;
+                self.trouble = None;
+                let _ = self.reload.send(());
+            }
+            Input::Pane(nvim_ui::Event::Notify(..)) => {}
+            Input::Reloaded(result) => self.reloaded(*result),
             Input::Pane(nvim_ui::Event::Exited) => {
                 self.editor = None;
                 self.pane_area = Rect::ZERO;
@@ -952,6 +1029,13 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("resolving {}", args.path.display()))?;
     let graph = load_graph(&args, &root)?;
+    // The same read, ready to be done again when the pane says a file was
+    // written. With SCIP that re-indexes, which is why it is never on the
+    // thread that draws.
+    let loader: Loader = {
+        let (args, root) = (args, root.clone());
+        std::sync::Arc::new(move || load_graph(&args, &root))
+    };
 
     // A panic with the terminal in raw mode leaves the shell unusable, and the
     // backtrace unreadable on top of the diagram. Restore first, then report.
@@ -988,7 +1072,7 @@ fn main() -> Result<()> {
             }
         });
 
-        let mut app = App::new(graph, viewport, root, inputs);
+        let mut app = App::new(graph, viewport, root, inputs, loader);
         run(&mut terminal, &mut app, &queue)
     })();
     restore();
@@ -1169,7 +1253,11 @@ mod tests {
         // Kept alive for as long as the app is, so a send cannot fail and
         // change what is under test.
         std::mem::forget(queue);
-        App::new(graph, viewport, ".".into(), inputs)
+        // Nothing on disk stands behind this graph, so a reload could only
+        // lie about it.
+        let loader: Loader =
+            std::sync::Arc::new(|| anyhow::bail!("this fixture has no tree to re-read"));
+        App::new(graph, viewport, ".".into(), inputs, loader)
     }
 
     fn app() -> App {
@@ -1630,10 +1718,18 @@ mod tests {
         (dir, graph)
     }
 
-    fn expanded_app(dir: &tempfile::TempDir, graph: EntityGraph) -> App {
+    /// The queue comes back with it: a test that sets a reload going has to
+    /// be the loop, and the loop is what drains this.
+    fn expanded_app(
+        dir: &tempfile::TempDir,
+        graph: EntityGraph,
+    ) -> (App, std::sync::mpsc::Receiver<Input>) {
         let (inputs, queue) = std::sync::mpsc::channel();
-        std::mem::forget(queue);
-        let mut app = App::new(graph, Rect::new(0, 0, 120, 20), dir.path().to_path_buf(), inputs);
+        let root = dir.path().to_path_buf();
+        let reread = root.clone();
+        let loader: Loader =
+            std::sync::Arc::new(move || treesitter_producer::graph_from_path(&reread));
+        let mut app = App::new(graph, Rect::new(0, 0, 120, 20), root, inputs, loader);
         for _ in 0..4 {
             for leaf in app.cursor.coalesced().leaves {
                 app.cursor.move_down(leaf, &app.graph);
@@ -1642,7 +1738,7 @@ mod tests {
         app.rebuild();
         app.body = Rect::new(0, 0, 120, 20);
         app.nvim_args = &["--clean"];
-        app
+        (app, queue)
     }
 
     fn entity_named<'a>(app: &'a App, name: &str) -> &'a entity_graph::Entity {
@@ -1669,7 +1765,7 @@ mod tests {
             return;
         }
         let (dir, graph) = project("fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    let y = 2;\n}\n");
-        let mut app = expanded_app(&dir, graph);
+        let (mut app, _queue) = expanded_app(&dir, graph);
         let (alpha, beta) = (entity_named(&app, "alpha").id, entity_named(&app, "beta").id);
         let beta_line = entity_named(&app, "beta").line_range.start;
         app.control(Control::Editor);
@@ -1715,7 +1811,7 @@ mod tests {
             return;
         }
         let (dir, graph) = project("fn target() {}\n\nfn caller() {\n    target();\n}\n");
-        let mut app = expanded_app(&dir, graph);
+        let (mut app, _queue) = expanded_app(&dir, graph);
         let (target, caller) =
             (entity_named(&app, "target").id, entity_named(&app, "caller").id);
         assert!(
@@ -1756,6 +1852,49 @@ mod tests {
         app.press(press(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(app.selected, Some(caller), "a blank line went somewhere");
         assert!(app.trouble.is_some(), "it went nowhere and said nothing");
+    }
+
+    /// Writing in the pane makes the diagram wrong, so it re-reads the tree
+    /// -- and has to come back with the user still where they were. Ids are
+    /// arena indices, so every one of them changed underneath.
+    #[test]
+    fn writing_in_the_pane_brings_the_diagram_up_to_date_without_losing_your_place() {
+        if !have_nvim() {
+            return;
+        }
+        let (dir, graph) = project("fn alpha() {}\n\nfn beta() {}\n");
+        let (mut app, queue) = expanded_app(&dir, graph);
+        app.control(Control::Editor);
+        app.select(entity_named(&app, "beta").id);
+        let held = app.cursor.leaves.len();
+        assert!(app.graph.entities.iter().all(|e| e.name != "gamma"), "gamma is the new thing");
+
+        // Written from underneath, then the pane is told it happened -- which
+        // is what nvim's own autocmd does after a `:w`.
+        std::fs::write(dir.path().join("lib.rs"), "fn alpha() {}\n\nfn beta() {}\n\nfn gamma() {}\n")
+            .expect("writing the file");
+        app.take(Input::Pane(nvim_ui::Event::Notify(editor::WROTE.into(), Vec::new())));
+        assert!(app.reloading, "nothing was set off");
+
+        let reloaded = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.reloading {
+            assert!(std::time::Instant::now() < reloaded, "the reload never came back");
+            if let Ok(input) = queue.recv_timeout(std::time::Duration::from_millis(50)) {
+                app.take(input);
+            }
+        }
+
+        assert!(app.trouble.is_none(), "reload said: {:?}", app.trouble);
+        assert!(
+            app.graph.entities.iter().any(|e| e.name == "gamma"),
+            "the diagram never saw the new function"
+        );
+        assert_eq!(app.cursor.leaves.len(), held + 1, "the expansion was not carried across");
+        assert_eq!(
+            app.selected.and_then(|id| app.graph.get(id)).map(|e| e.name.as_str()),
+            Some("beta"),
+            "the selection did not survive the renumbering"
+        );
     }
 
     /// The panel exists so the mouse can do what the keys do. A click on a
