@@ -72,6 +72,10 @@ served extensionless (`/ui/vendor/hljs/rust`) to match the import-map prefix
   that still resolve to different drawn nodes, or no target at all, select
   nothing. Under tree-sitter this is as approximate as the producer's
   name-based resolution; under SCIP it is precise.
+  This paragraph is the spec for two implementations, not one: `goto.js`
+  here, and `entity_graph::goto` for the terminal viewer, which reaches the
+  same rule from `ctrl-w d`. They answer to the same examples; changing one
+  means changing the other.
 - Containment is `parent` on the node; there is no separate edge list.
 - `nodes` is sorted by `id` and dense (`nodes[i].id == i`).
 - `generation` starts at 1 and grows by one per successful rebuild. `remap`

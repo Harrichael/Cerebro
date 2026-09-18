@@ -56,6 +56,7 @@ const KEYS: &[(&str, &str)] = &[
     ("o  /  ctrl-w l", "open the editor pane, and go to it"),
     ("ctrl-w h", "from the pane, back to the diagram"),
     ("ctrl-w < >", "move the divider between them"),
+    ("ctrl-w d", "in the pane: select what the word under the cursor refers to"),
     ("?", "this list"),
     ("q  /  esc  /  ctrl-c", "quit"),
 ];
@@ -386,6 +387,46 @@ impl App {
         let Some(inner) = self.graph.innermost_at(file, line) else { return };
         if let Some(drawn) = self.drawn_leaf_for(inner) {
             self.select_from_pane(drawn);
+        }
+    }
+
+    /// Select whatever the word under the pane's cursor refers to.
+    ///
+    /// The pane deliberately stays where it is, so the calls in one function
+    /// can be clicked through one after another -- the browser's code pane
+    /// works the same way, for the same reason.
+    fn go_to_definition(&mut self) {
+        let Some(editor) = self.editor.as_ref() else { return };
+        let Some((line, column, text)) = editor.cursor_site() else { return };
+        let file = editor
+            .current_file()
+            .and_then(|path| Some(path.strip_prefix(&self.root).ok()?.to_path_buf()))
+            .and_then(|rel| self.graph.file_at_path(&rel));
+        let Some(file) = file else {
+            self.trouble = Some("that file is not in the graph".into());
+            return;
+        };
+
+        // Several targets are only a problem if the view still tells them
+        // apart; folded into one drawn node they are one answer.
+        let mut drawn: Vec<EntityId> =
+            entity_graph::goto::reference_targets(&self.graph, file, line, &text, column)
+                .into_iter()
+                .filter_map(|id| self.drawn_leaf_for(id))
+                .collect();
+        drawn.sort();
+        drawn.dedup();
+        match drawn.as_slice() {
+            [one] => {
+                let one = *one;
+                self.trouble = None;
+                self.select_from_pane(one);
+            }
+            [] => self.trouble = Some("nothing here refers to anything on the diagram".into()),
+            many => {
+                let n = many.len();
+                self.trouble = Some(format!("that goes to {n} different places"));
+            }
         }
     }
 
@@ -738,6 +779,7 @@ impl App {
                 Some(Handled::Pane) => {}
                 Some(Handled::GiveUpFocus) => self.focus = Focus::Graph,
                 Some(Handled::Resize(by)) => self.widen_pane(by),
+                Some(Handled::GoToDefinition) => self.go_to_definition(),
                 // Focus without a pane to hold it; put it back.
                 None => self.focus = Focus::Graph,
             }
@@ -1663,6 +1705,57 @@ mod tests {
         );
         app.follow_pane_cursor();
         assert_eq!(app.selected, Some(beta), "the diagram did not follow the cursor");
+    }
+
+    /// The pane is not just a viewer: `ctrl-w d` on a call selects what it
+    /// calls, which is the browser's click-an-identifier, done with a key.
+    #[test]
+    fn ctrl_w_d_selects_what_the_word_under_the_cursor_refers_to() {
+        if !have_nvim() {
+            return;
+        }
+        let (dir, graph) = project("fn target() {}\n\nfn caller() {\n    target();\n}\n");
+        let mut app = expanded_app(&dir, graph);
+        let (target, caller) =
+            (entity_named(&app, "target").id, entity_named(&app, "caller").id);
+        assert!(
+            app.graph.references.iter().any(|r| r.from == caller && r.to == target),
+            "the producer recorded no call to go to"
+        );
+        app.control(Control::Editor);
+        app.select(caller);
+
+        // On the `target` of `    target();` -- row 4 counting from one,
+        // column 4 counting from zero.
+        app.editor
+            .as_ref()
+            .expect("the pane is open")
+            .nvim()
+            .call(
+                "nvim_win_set_cursor",
+                vec![0.into(), nvim_ui::Value::Array(vec![4.into(), 4.into()])],
+            )
+            .expect("moving the cursor");
+
+        app.press(press(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.press(press(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.selected, Some(target), "trouble was {:?}", app.trouble);
+
+        // And off a name, it says so rather than selecting something random.
+        app.select(caller);
+        app.editor
+            .as_ref()
+            .expect("still open")
+            .nvim()
+            .call(
+                "nvim_win_set_cursor",
+                vec![0.into(), nvim_ui::Value::Array(vec![2.into(), 0.into()])],
+            )
+            .expect("moving the cursor");
+        app.press(press(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.press(press(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.selected, Some(caller), "a blank line went somewhere");
+        assert!(app.trouble.is_some(), "it went nowhere and said nothing");
     }
 
     /// The panel exists so the mouse can do what the keys do. A click on a

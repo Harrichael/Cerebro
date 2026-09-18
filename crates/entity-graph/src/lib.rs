@@ -24,6 +24,7 @@
 //! Consumers never learn which producer built the graph.
 
 mod model;
+pub mod goto;
 pub mod test_code;
 
 pub use model::*;

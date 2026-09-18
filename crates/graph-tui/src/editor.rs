@@ -39,6 +39,8 @@ pub enum Handled {
     GiveUpFocus,
     /// `ctrl-w <` or `ctrl-w >`.
     Resize(i32),
+    /// `ctrl-w d`: go to whatever the word under the cursor refers to.
+    GoToDefinition,
 }
 
 pub struct Editor {
@@ -186,6 +188,10 @@ impl Editor {
             KeyCode::Char('h') if !self.has_window_toward('h') => Handled::GiveUpFocus,
             KeyCode::Char('<') => Handled::Resize(-RESIZE_STEP),
             KeyCode::Char('>') => Handled::Resize(RESIZE_STEP),
+            // Nvim's own `ctrl-w d` jumps to the definition of the word under
+            // the cursor, which is what this does; it just answers with the
+            // graph rather than with a tags file.
+            KeyCode::Char('d') => Handled::GoToDefinition,
             _ => {
                 self.nvim.input("<C-w>");
                 self.nvim.key(key);
@@ -213,6 +219,18 @@ impl Editor {
         let name = self.nvim.eval("expand('%:p')").ok()?;
         let name = name.as_str().filter(|n| !n.is_empty())?;
         Some(std::path::PathBuf::from(name))
+    }
+
+    /// Where the cursor is in the file: the line (0-indexed), the byte
+    /// column within it, and the text of that line.
+    pub fn cursor_site(&self) -> Option<(usize, usize, String)> {
+        let at = self.nvim.call("nvim_win_get_cursor", vec![0.into()]).ok()?;
+        let at = at.as_array()?;
+        // Nvim counts these rows from one and these columns from zero.
+        let line = (at.first()?.as_u64()? as usize).checked_sub(1)?;
+        let column = at.get(1)?.as_u64()? as usize;
+        let text = self.nvim.call("nvim_get_current_line", vec![]).ok()?;
+        Some((line, column, text.as_str()?.to_owned()))
     }
 
     pub fn mouse(&self, kind: MouseEventKind, column: u16, row: u16, area: Rect) {
