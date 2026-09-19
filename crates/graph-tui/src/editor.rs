@@ -255,6 +255,8 @@ impl Editor {
             MouseEventKind::Down(MouseButton::Left) => ("left", "press"),
             MouseEventKind::Down(MouseButton::Right) => ("right", "press"),
             MouseEventKind::Down(MouseButton::Middle) => ("middle", "press"),
+            MouseEventKind::Drag(MouseButton::Left) => ("left", "drag"),
+            MouseEventKind::Up(MouseButton::Left) => ("left", "release"),
             MouseEventKind::ScrollUp => ("wheel", "up"),
             MouseEventKind::ScrollDown => ("wheel", "down"),
             MouseEventKind::ScrollLeft => ("wheel", "left"),

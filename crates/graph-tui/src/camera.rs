@@ -146,6 +146,24 @@ impl Camera {
             .then_some((x as u16, y as u16))
     }
 
+    /// The diagram coordinate under a screen cell, wherever it is -- off the
+    /// diagram, off the viewport. A sweep that starts on the margin and ends
+    /// on the picture still has to mean a rectangle.
+    /// The screen cell a diagram point is drawn at, which may be off screen.
+    pub fn screen_of(&self, point: (u16, u16)) -> (i32, i32) {
+        (
+            i32::from(point.0) - self.offset.0 + i32::from(self.viewport.x),
+            i32::from(point.1) - self.offset.1 + i32::from(self.viewport.y),
+        )
+    }
+
+    pub fn unclamped_at(&self, col: u16, row: u16) -> (i32, i32) {
+        (
+            i32::from(col) - i32::from(self.viewport.x) + self.offset.0,
+            i32::from(row) - i32::from(self.viewport.y) + self.offset.1,
+        )
+    }
+
     /// Scroll the smallest amount that brings `r` fully on screen.
     pub fn reveal(&mut self, r: Rect) {
         self.offset.0 = reveal_axis(self.offset.0, r.x, r.right(), self.viewport.width);

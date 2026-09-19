@@ -4,10 +4,12 @@
 //!
 //!   cargo run -p graph-tui --example spike -- <path> [depth] [width] [close|mid|far]
 
-use graph_tui::view::Settings;
 use graph_tui::label::Labels;
+use graph_tui::layout::{Layout, Options};
+use graph_tui::render::{self, Lit};
+use graph_tui::scene::Scene;
+use graph_tui::view::{self, Settings};
 use graph_tui::zoom::Zoom;
-use graph_tui::{placer, render, view};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -28,11 +30,14 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let settings = Settings::default();
-    let picture = view::apply(&graph, &cursor.coalesced(), &settings);
+    let picture = view::apply(&graph, &cursor.coalesced(), &Settings::default());
     let labels = Labels::new(&graph);
-    let diagram = placer::place(&labels, &picture, width, zoom);
-    let (buf, stats) = render::render(&labels, &diagram, None);
+    let scene = Scene::new(&graph, &picture);
+    let mut layout = Layout::new();
+    layout.settle(&scene, &labels, width);
+    let diagram = layout.materialize(&scene, &labels, zoom, &Options::default());
+    let rendered = render::render(&labels, &scene, &diagram, Lit::none());
+    let buf = rendered.compose(Lit::none());
 
     for y in 0..buf.area().height {
         let row: String =
@@ -41,12 +46,12 @@ fn main() -> anyhow::Result<()> {
     }
     let leaves = diagram.nodes.iter().filter(|n| !n.is_box).count();
     eprintln!(
-        "depth {depth}: {leaves} leaves in {} boxes -> {}x{}; edges {} drawn, {} unroutable",
+        "depth {depth}: {leaves} leaves in {} boxes -> {}x{}; edges {}, {} cross something",
         diagram.nodes.len() - leaves,
         diagram.width,
         diagram.height,
-        stats.submitted - stats.unroutable,
-        stats.unroutable,
+        rendered.stats.submitted,
+        rendered.stats.unroutable,
     );
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! What is in the picture, before anything decides where it goes.
 //!
 //! The seed of the diagram model. It holds the rules that change *which* nodes
-//! and edges exist — not how they are laid out (`placer`) or drawn (`render`).
+//! and edges exist — not how they are laid out (`layout`) or drawn (`render`).
 //! Today that is the test filter, edge collapse, hiding and scoping; bundling
 //! joins them here when it arrives.
 //!
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(named(&scoped), vec![lib], "scoping should keep only what is under it");
     }
 
-    /// Dropping a test leaf has to drop its edges too, or the placer is handed
+    /// Dropping a test leaf has to drop its edges too, or the layout is handed
     /// an edge whose endpoint is not in the picture.
     #[test]
     fn hiding_tests_drops_their_edges_with_them() {

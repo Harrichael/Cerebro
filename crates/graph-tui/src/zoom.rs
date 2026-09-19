@@ -77,6 +77,14 @@ impl Zoom {
         }
     }
 
+    /// How large this draws next to the unit the virtual layout is kept in.
+    /// A position that persists across zooms is scaled by this on the way to
+    /// the screen, so the same arrangement is the same arrangement drawn
+    /// smaller rather than a fresh one.
+    pub fn scale(self) -> f32 {
+        f32::from(self.metrics().leaf_h) / f32::from(Zoom::Close.metrics().leaf_h)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Zoom::Close => "close",

@@ -1,7 +1,10 @@
 //! One number set, six levels, so before/after are actually comparable.
 use graph_tui::label::Labels;
+use graph_tui::layout::{Layout, Options};
+use graph_tui::render::{self, Lit};
+use graph_tui::scene::Scene;
+use graph_tui::view;
 use graph_tui::zoom::Zoom;
-use graph_tui::{placer, render, view};
 use std::time::Instant;
 fn main() -> anyhow::Result<()> {
     let levels: Vec<(&str, usize)> = vec![
@@ -20,27 +23,24 @@ fn main() -> anyhow::Result<()> {
         for _ in 0..depth { for l in c.coalesced().leaves { c.move_down(l, &graph); } }
         let pic = view::apply(&graph, &c.coalesced(), &Default::default());
         let labels = Labels::new(&graph);
-        let d = placer::place(&labels, &pic, 200, zoom);
+        let scene = Scene::new(&graph, &pic);
+        let t0 = Instant::now();
+        let mut layout = Layout::new();
+        layout.settle(&scene, &labels, 200);
+        let d = layout.materialize(&scene, &labels, zoom, &Options::default());
+        let lay_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
-        let (buf, s) = render::render(&labels, &d, None);
+        let r = render::render(&labels, &scene, &d, Lit::none());
         let ms = t.elapsed().as_secs_f64() * 1000.0;
-        // Detour: drawn line cells against straight-line distance, as a crude
-        // check that routes are not snaking across the whole canvas.
-        let ink = (0..buf.area().height).flat_map(|y| (0..buf.area().width).map(move |x| (x, y)))
-            .filter(|&(x, y)| matches!(buf[(x, y)].symbol(), "─"|"│"|"┌"|"┐"|"└"|"┘"|"├"|"┤"|"┬"|"┴"|"┼"))
-            .count();
-        let straight: usize = d.edges.iter().filter_map(|e| {
-            let a = d.nodes.iter().find(|n| n.id == e.from)?.rect;
-            let b = d.nodes.iter().find(|n| n.id == e.to)?.rect;
-            Some((a.x as i32 - b.x as i32).unsigned_abs() as usize
-               + (a.y as i32 - b.y as i32).unsigned_abs() as usize)
-        }).sum();
+        let t = Instant::now();
+        let _ = r.compose(Lit::none());
+        let comp_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let s = &r.stats;
         tot += s.submitted; fail += s.unroutable;
-        println!("{path:>20} d{depth}: {:>4}/{:<4} fail {:>2}% | {:>5.0}ms | ink/straight {:.2}",
-            s.submitted - s.unroutable, s.submitted,
-            (s.unroutable * 100).checked_div(s.submitted).unwrap_or(0), ms,
-            if straight > 0 { ink as f64 / straight as f64 } else { 0.0 });
+        println!("{path:>20} d{depth}: {:>4} edges, {:>3} cross ({:>2}%) | layout {:>4.0}ms render {:>5.0}ms compose {:>3.0}ms | {}x{}",
+            s.submitted, s.unroutable,
+            (s.unroutable * 100).checked_div(s.submitted).unwrap_or(0), lay_ms, ms, comp_ms, d.width, d.height);
     }
-    println!("TOTAL ({}): {}/{} drawn, {}% fail", zoom.name(), tot - fail, tot, fail * 100 / tot.max(1));
+    println!("TOTAL ({}): {}/{} clean, {}% cross", zoom.name(), tot - fail, tot, fail * 100 / tot.max(1));
     Ok(())
 }

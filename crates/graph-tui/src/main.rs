@@ -22,8 +22,9 @@ use graph_tui::camera::Camera;
 use graph_tui::controls::{self, Control, NodeAction, State};
 use graph_tui::editor::{self, Editor, Handled};
 use graph_tui::label::Labels;
-use graph_tui::placer::{self, Diagram};
-use graph_tui::render::{self, Stats};
+use graph_tui::layout::{Diagram, Layout, Options};
+use graph_tui::render::{self, Lit, Rendered};
+use graph_tui::scene::Scene;
 use graph_tui::view::{self, Settings};
 use graph_tui::zoom::Zoom;
 
@@ -43,11 +44,18 @@ const WHEEL_X: i32 = 6;
 /// undiscoverable. Everything that does something is listed here -- except the
 /// switches, which say their own keys in the corner of the screen.
 const KEYS: &[(&str, &str)] = &[
-    ("↑ ↓ ← →  /  k j h l", "scroll"),
+    ("↑ ↓ ← →", "move the focus to the nearest node that way, among its siblings"),
+    ("tab  ⇧tab", "focus into a box, or out to the box around"),
+    ("ctrl-↑ ↓ ← →", "move the focused node -- or its group -- a step"),
+    ("⇧↑ ↓ ← →  /  k j h l", "scroll"),
     ("PgUp PgDn  /  space", "scroll a half screen"),
     ("Home End  /  g G", "back to the start, or the bottom"),
-    ("tab ⇧tab  /  n p", "select the next or previous node"),
+    ("n p", "focus the next or previous node, reading order"),
     ("click", "select a node, or press a button on its frame"),
+    ("⇧click", "add a node to the group, or take it out"),
+    ("drag", "move a node -- or the group it is in; drag a box by its title"),
+    ("drag on nothing", "sweep out a group"),
+    ("L", "lay the whole picture out afresh"),
     ("scroll  ⇧scroll", "pan up and down, or left and right"),
     ("c", "centre the diagram (same as Home)"),
     ("↵  /  +", "expand the selected node into its children"),
@@ -105,12 +113,21 @@ struct App {
     /// How large the same graph is drawn, which is a different question from
     /// how much of the graph is expanded.
     zoom: Zoom,
+    /// Where every node logically sits, kept across rebuilds. What a drag edits.
+    layout: Layout,
+    scene: Scene,
     diagram: Diagram,
+    /// The painted nodes and routed edges of `diagram`.
+    rendered: Rendered,
+    /// `rendered` composed for the current selection: what gets blitted.
     canvas: Buffer,
-    stats: Stats,
     camera: Camera,
     /// Always a drawn leaf, never a box; see `rebuild`.
     selected: Option<EntityId>,
+    /// Nodes gathered by a marquee or shift-clicks, which move as one. The
+    /// primary selection is not necessarily among them.
+    group: std::collections::BTreeSet<EntityId>,
+    drag: Drag,
     /// Edges are laid out either way; this only decides whether they are
     /// drawn. Turning them off to read the names should not move the names.
     show_edges: bool,
@@ -161,6 +178,49 @@ enum Focus {
     Pane,
 }
 
+/// What the left button is holding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Drag {
+    Idle,
+    /// Pressed, not yet moved. A click and a drag start the same way, and
+    /// which one it was is only known when the pointer moves or lets go.
+    Pending { at: (u16, u16), grab: Grab },
+    /// Nodes in flight. `levels` are the levels left alone while they move
+    /// and committed when they land. `held` is the node under the pointer
+    /// and how far its corner is from the pointer, which is what keeps the
+    /// screen still: the canvas is normalised to its own top-left, so when
+    /// the top-most node moves the whole picture would otherwise slide.
+    Moving {
+        last: (u16, u16),
+        moved: Vec<EntityId>,
+        levels: std::collections::BTreeSet<Option<EntityId>>,
+        held: (EntityId, (i32, i32)),
+    },
+    /// Sweeping out a group, in screen cells.
+    Marquee { from: (u16, u16), to: (u16, u16) },
+}
+
+/// What the camera keeps still while the picture is rebuilt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anchor {
+    /// Nothing in particular: fit the new picture and bring the selection on.
+    Fit,
+    /// A diagram point stays under a screen cell, scaled with the picture.
+    /// A zoom, and nothing else: the picture is the same, drawn larger.
+    Scaled { screen: (u16, u16), point: (u16, u16) },
+    /// A node's corner, offset by `corner`, stays under a screen cell. A
+    /// drag holds the grabbed cell under the pointer; an expand holds the
+    /// opened node where it was.
+    Node { id: EntityId, corner: (i32, i32), screen: (i32, i32) },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grab {
+    Leaf(EntityId),
+    Box(EntityId),
+    Nothing,
+}
+
 impl App {
     fn new(
         graph: EntityGraph,
@@ -171,22 +231,21 @@ impl App {
     ) -> Self {
         let cursor = coalesce::Cursor::new(&graph);
         let reload = spawn_reloader(loader, inputs.clone());
+        let rendered = render::render(&Labels::new(&graph), &Scene::default(), &Diagram::empty(), Lit::none());
         let mut app = App {
             graph,
             cursor,
             settings: Settings::default(),
             zoom: Zoom::Close,
-            diagram: Diagram {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                width: 0,
-                height: 0,
-                zoom: Zoom::Close,
-            },
+            layout: Layout::new(),
+            scene: Scene::default(),
+            diagram: Diagram::empty(),
+            rendered,
             canvas: Buffer::empty(Rect::new(0, 0, 1, 1)),
-            stats: Stats { submitted: 0, unroutable: 0 },
             camera: Camera::new(viewport, (0, 0)),
             selected: None,
+            group: Default::default(),
+            drag: Drag::Idle,
             show_edges: true,
             panel: controls::Panel::default(),
             help: false,
@@ -227,6 +286,8 @@ impl App {
         self.cursor =
             coalesce::migrate::migrate_cursor(&old, &self.cursor.leaves, &map, &self.graph);
         self.selected = self.selected.and_then(moved);
+        self.group = self.group.iter().copied().filter_map(moved).collect();
+        self.layout.migrate(&map);
         self.settings.hidden = self.settings.hidden.iter().copied().filter_map(moved).collect();
         self.settings.scope = self.settings.scope.and_then(moved);
         // The pane is showing a file, not an id, so it needs nothing said to
@@ -322,41 +383,65 @@ impl App {
     }
 
     fn rebuild(&mut self) {
-        self.rebuild_holding(None);
+        self.rebuild_with(Anchor::Fit, &Options::default());
     }
 
-    /// `hold` is a screen cell and the diagram cell under it. Passing one says
-    /// the picture is unchanged and only its size differs -- which is true of
-    /// zooming and of nothing else here.
-    fn rebuild_holding(&mut self, hold: Option<((u16, u16), (u16, u16))>) {
+    /// Rebuild keeping the node the user is acting on where it is on screen.
+    fn rebuild_around(&mut self, id: EntityId, opts: &Options) {
+        let anchor = match self.diagram.rect_of(id) {
+            Some(r) => Anchor::Node { id, corner: (0, 0), screen: self.camera.screen_of((r.x, r.y)) },
+            None => Anchor::Fit,
+        };
+        self.rebuild_with(anchor, opts);
+    }
+
+    fn lit(&self) -> Lit<'_> {
+        Lit { primary: self.selected, group: &self.group }
+    }
+
+    /// `anchor` is what the camera keeps still through the change; `opts` is
+    /// what a drag in flight asks: its nodes anchored, their levels left alone.
+    fn rebuild_with(&mut self, anchor: Anchor, opts: &Options) {
         let picture = view::apply(&self.graph, &self.cursor.coalesced(), &self.settings);
-        self.diagram =
-            placer::place(&self.labels(), &picture, self.camera.viewport.width.max(20), self.zoom);
-        // Only a leaf can be selected: expanding acts on cursor leaves, and a
-        // box is an ancestor of one. Keeping a selection that has become a box
-        // leaves every later `step_selection` unable to find its own starting
-        // point, so tab silently returns to the first leaf each press.
-        let still_a_leaf =
-            self.diagram.nodes.iter().any(|n| !n.is_box && Some(n.id) == self.selected);
-        if !still_a_leaf {
+        self.scene = Scene::new(&self.graph, &picture);
+        let labels = Labels::new(&self.graph);
+        // Nodes the layout has never seen are ranked into place; everything
+        // else stays exactly where it was, which is what lets a drag mean
+        // anything.
+        self.layout.settle(&self.scene, &labels, self.camera.viewport.width.max(20));
+        self.diagram = self.layout.materialize(&self.scene, &labels, self.zoom, opts);
+        // What the push moved is kept, except mid-drag -- the siblings make
+        // way at the drop, not before -- and when only the zoom changed:
+        // coarser text overlaps where the close text did not, and writing
+        // that back would spread the close picture a little on every zoom.
+        if !matches!(anchor, Anchor::Scaled { .. }) && !matches!(self.drag, Drag::Moving { .. }) {
+            self.layout.commit(&self.diagram, &self.scene);
+        }
+        // A box is as selectable as a leaf -- the keyboard walks into and
+        // out of boxes -- so the selection only moves when what it named is
+        // no longer drawn at all.
+        let still_drawn = self.diagram.nodes.iter().any(|n| Some(n.id) == self.selected);
+        if !still_drawn {
             self.selected = self.inherit_selection();
         }
+        let drawn: std::collections::BTreeSet<EntityId> =
+            self.diagram.nodes.iter().filter(|n| !n.is_box).map(|n| n.id).collect();
+        self.group.retain(|id| drawn.contains(id));
         // After placement, not before: the edges still rank the layout, so
         // turning them off reads the same picture with the lines taken away
         // rather than reshuffling every node on screen.
         if !self.show_edges {
             self.diagram.edges.clear();
         }
-        let (canvas, stats) = render::render(&self.labels(), &self.diagram, self.selected);
-        self.canvas = canvas;
-        self.stats = stats;
-        // A picture of a different size opens centred, but the node the user
-        // was looking at is a better anchor than the coordinate they were at:
-        // widening the terminal by one column re-lays-out the whole diagram,
-        // and snapping back to the top on every column of a drag is unusable.
-        match hold {
-            Some((screen, point)) => self.camera.rescale(self.diagram.extent(), screen, point),
-            None => {
+        self.rendered = render::render(&labels, &self.scene, &self.diagram, self.lit());
+        self.canvas = self.rendered.compose(self.lit());
+        match anchor {
+            Anchor::Scaled { screen, point } => self.camera.rescale(self.diagram.extent(), screen, point),
+            Anchor::Node { id, corner, screen } => {
+                self.camera.extent = self.diagram.extent();
+                self.hold_under_pointer((id, corner), screen);
+            }
+            Anchor::Fit => {
                 self.camera.fit(self.diagram.extent());
                 if let Some(rect) = self.selected.and_then(|id| self.diagram.rect_of(id)) {
                     self.camera.reveal(rect);
@@ -365,11 +450,12 @@ impl App {
         }
     }
 
-    /// Two boxes change; nothing else on the canvas does.
-    fn redraw_selection(&mut self, was: Option<EntityId>) {
-        let changed: Vec<EntityId> = [was, self.selected].into_iter().flatten().collect();
+    /// Some nodes changed how they are lit; nothing moved.
+    fn redraw_selection(&mut self, changed: &[EntityId]) {
         let labels = Labels::new(&self.graph);
-        render::restyle(&labels, &self.diagram, &mut self.canvas, &changed, self.selected);
+        let lit = Lit { primary: self.selected, group: &self.group };
+        self.rendered.restyle(&labels, &self.diagram, changed, lit);
+        self.canvas = self.rendered.compose(lit);
     }
 
     /// Move the selection, bringing the new node on screen. Both tab and a
@@ -396,7 +482,8 @@ impl App {
         if let Some(rect) = self.diagram.rect_of(id) {
             self.camera.reveal(rect);
         }
-        self.redraw_selection(was);
+        let changed: Vec<EntityId> = [was, Some(id)].into_iter().flatten().collect();
+        self.redraw_selection(&changed);
         if tell_pane {
             self.show_in_pane(id);
         }
@@ -511,19 +598,93 @@ impl App {
     /// Move the selection through the drawn leaves in reading order, and scroll
     /// far enough to put the new one on screen.
     fn step_selection(&mut self, forward: bool) {
-        let mut leaves: Vec<(EntityId, Rect)> =
-            self.diagram.nodes.iter().filter(|n| !n.is_box).map(|n| (n.id, n.rect)).collect();
-        leaves.sort_by_key(|(_, r)| (r.y, r.x));
-        if leaves.is_empty() {
+        let mut nodes: Vec<(EntityId, Rect)> = self.diagram.nodes.iter().map(|n| (n.id, n.rect)).collect();
+        nodes.sort_by_key(|(_, r)| (r.y, r.x));
+        if nodes.is_empty() {
             return;
         }
-        let at = leaves.iter().position(|(id, _)| Some(*id) == self.selected);
+        let at = nodes.iter().position(|(id, _)| Some(*id) == self.selected);
         let next = match (at, forward) {
-            (Some(i), true) => (i + 1) % leaves.len(),
-            (Some(i), false) => (i + leaves.len() - 1) % leaves.len(),
+            (Some(i), true) => (i + 1) % nodes.len(),
+            (Some(i), false) => (i + nodes.len() - 1) % nodes.len(),
             (None, _) => 0,
         };
-        self.select(leaves[next].0);
+        self.select(nodes[next].0);
+    }
+
+    /// Focus the nearest sibling in a direction: the one closest along it
+    /// with the least sideways offset, in the proportions the eye sees them
+    /// (a cell is twice as tall as it is wide). Siblings are the children
+    /// of the same box, so the arrows never leave the level; tab does that.
+    /// Nothing squarely that way falls back to anything at all that way,
+    /// so a wrapped row's next row is still "down" from its end.
+    fn move_focus(&mut self, dir: (i32, i32)) {
+        let Some(sel) = self.selected else {
+            self.focus_in();
+            return;
+        };
+        let Some(from) = self.diagram.rect_of(sel) else { return };
+        let centre = |r: Rect| (f32::from(r.x) + f32::from(r.width) / 2.0, f32::from(r.y) + f32::from(r.height) / 2.0);
+        let (fx, fy) = centre(from);
+        let level = self.scene.parent.get(&sel).copied();
+        let best = self
+            .scene
+            .children(level)
+            .iter()
+            .filter(|&&id| id != sel)
+            .filter_map(|&id| Some((id, centre(self.diagram.rect_of(id)?))))
+            .filter_map(|(id, (x, y))| {
+                let (dx, dy) = ((x - fx) / 2.0, y - fy);
+                let ahead = dx * dir.0 as f32 + dy * dir.1 as f32;
+                let aside = (dx * dir.1 as f32 - dy * dir.0 as f32).abs();
+                (ahead > 0.0).then_some((id, (aside > ahead, ahead + 2.0 * aside)))
+            })
+            .min_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)));
+        if let Some((id, _)) = best {
+            self.select(id);
+        }
+    }
+
+    /// Into the focused box: its first child in reading order. With nothing
+    /// focused, the first root.
+    fn focus_in(&mut self) {
+        let level = match self.selected {
+            None => None,
+            Some(id) if self.scene.is_box(id) => Some(id),
+            Some(_) => return,
+        };
+        let first = self
+            .scene
+            .children(level)
+            .iter()
+            .filter_map(|&id| Some((id, self.diagram.rect_of(id)?)))
+            .min_by_key(|(_, r)| (r.y, r.x))
+            .map(|(id, _)| id);
+        if let Some(id) = first {
+            self.select(id);
+        }
+    }
+
+    /// Out to the box around the focus.
+    fn focus_out(&mut self) {
+        if let Some(parent) = self.selected.and_then(|id| self.scene.parent.get(&id).copied()) {
+            self.select(parent);
+        }
+    }
+
+    /// Move the focused node -- or the group it is in -- a step, the way a
+    /// drag would: it lands there, its siblings make way, and it holds its
+    /// place on screen while the canvas re-normalises underneath.
+    fn shove(&mut self, by: (i32, i32)) {
+        let Some(sel) = self.selected else { return };
+        let Some(rect) = self.diagram.rect_of(sel) else { return };
+        let ids: Vec<EntityId> =
+            if self.group.contains(&sel) { self.group.iter().copied().collect() } else { vec![sel] };
+        let screen = self.camera.screen_of((rect.x, rect.y));
+        self.layout.nudge(&ids, by, self.zoom);
+        let opts = Options { anchored: ids.into_iter().collect(), loose: Default::default() };
+        let anchor = Anchor::Node { id: sel, corner: (0, 0), screen: (screen.0 + by.0, screen.1 + by.1) };
+        self.rebuild_with(anchor, &opts);
     }
 
     /// What each switch currently reads. Kept next to the code that acts on
@@ -539,6 +700,7 @@ impl App {
             Control::ShowAll => {
                 State::Undo(self.settings.hidden.len() + usize::from(self.settings.scope.is_some()))
             }
+            Control::Relayout => State::Action(!self.diagram.nodes.is_empty()),
             Control::CollapseAll => State::Action(
                 self.cursor
                     .active()
@@ -561,11 +723,14 @@ impl App {
             // the shared `rebuild` at the end of this function would re-centre.
             Control::Zoom => {
                 let screen = self.viewport_middle();
-                let hold = self.camera.at(screen.0, screen.1).map(|p| (screen, p));
+                let anchor = self.camera.at(screen.0, screen.1).map_or(Anchor::Fit, |point| Anchor::Scaled { screen, point });
                 self.zoom = self.zoom.cycle();
-                self.rebuild_holding(hold);
+                self.rebuild_with(anchor, &Options::default());
                 return;
             }
+            // Every position is forgotten, so the next rebuild ranks the whole
+            // picture as if it had just been opened.
+            Control::Relayout => self.layout.clear(),
             Control::Tests => self.settings.show_tests = !self.settings.show_tests,
             Control::OnePerPair => self.settings.one_per_pair = !self.settings.one_per_pair,
             Control::Edges => self.show_edges = !self.show_edges,
@@ -609,12 +774,20 @@ impl App {
     fn expand(&mut self) {
         let Some(id) = self.selected else { return };
         if self.cursor.move_down(id, &self.graph) {
-            self.rebuild();
+            // The node the user opened stays where it is, on the canvas and
+            // on the screen; its siblings make way.
+            let opts = Options { anchored: [id].into_iter().collect(), loose: Default::default() };
+            self.rebuild_around(id, &opts);
         }
     }
 
-    /// Fold the selected node back into its parent.
+    /// Fold the selected node back into its parent; a selected box folds
+    /// into itself.
     fn collapse(&mut self) {
+        if let Some(id) = self.selected.filter(|&id| self.scene.is_box(id)) {
+            self.collapse_into(id);
+            return;
+        }
         let Some(id) = self.selected else {
             // Nothing is drawn -- every node at this level was filtered out.
             // Collapsing the whole cursor is the only way out that does not
@@ -627,9 +800,12 @@ impl App {
         };
         if self.cursor.move_up(id, &self.graph) {
             // The node folds into its parent, which is what the user is now
-            // looking at.
+            // looking at; the parent shrinks in place.
             self.selected = self.graph.get(id).and_then(|e| e.parent);
-            self.rebuild();
+            match self.selected {
+                Some(parent) => self.rebuild_around(parent, &Options::default()),
+                None => self.rebuild(),
+            }
         }
     }
 
@@ -652,7 +828,7 @@ impl App {
             }
         }
         self.selected = Some(id);
-        self.rebuild();
+        self.rebuild_around(id, &Options::default());
     }
 
     /// Draw the same graph larger or smaller, holding `screen` still. Nothing
@@ -662,9 +838,9 @@ impl App {
         // Whatever is under that cell is what the user is reading, so it is
         // what the new size is measured around. Off the diagram -- in the
         // margin around a small one -- there is nothing to hold.
-        let hold = self.camera.at(screen.0, screen.1).map(|p| (screen, p));
+        let anchor = self.camera.at(screen.0, screen.1).map_or(Anchor::Fit, |point| Anchor::Scaled { screen, point });
         self.zoom = next;
-        self.rebuild_holding(hold);
+        self.rebuild_with(anchor, &Options::default());
     }
 
     /// The middle of the screen, for a zoom worked from the keyboard: there is
@@ -698,6 +874,9 @@ impl App {
         let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
         match ev.kind {
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to((ev.column, ev.row)),
+            MouseEventKind::Up(MouseButton::Left) => self.drop_at((ev.column, ev.row)),
+            MouseEventKind::Drag(_) | MouseEventKind::Up(_) | MouseEventKind::Moved => {}
             MouseEventKind::ScrollUp if ctrl => self.zoom_at(ev.column, ev.row, true),
             MouseEventKind::ScrollDown if ctrl => self.zoom_at(ev.column, ev.row, false),
 
@@ -719,14 +898,151 @@ impl App {
             // A node's own buttons sit on its frame, which is inside its
             // rect, so they have to be tried before the rect selects.
             MouseEventKind::Down(MouseButton::Left) => {
+                let at = (ev.column, ev.row);
                 if let Some((id, action)) = self.button_under(ev.column, ev.row) {
                     self.node_action(id, action);
                 } else if let Some(id) = self.leaf_under(ev.column, ev.row) {
+                    if shift {
+                        self.toggle_in_group(id);
+                    } else {
+                        // Pressing a node outside the group means that node
+                        // alone; pressing one inside it means the group.
+                        if !self.group.contains(&id) {
+                            self.clear_group();
+                        }
+                        self.select(id);
+                    }
+                    self.drag = Drag::Pending { at, grab: Grab::Leaf(id) };
+                } else if let Some(id) = self.camera.at(at.0, at.1).and_then(|p| self.diagram.handle_at(p)) {
+                    self.clear_group();
                     self.select(id);
+                    self.drag = Drag::Pending { at, grab: Grab::Box(id) };
+                } else {
+                    self.drag = Drag::Pending { at, grab: Grab::Nothing };
                 }
             }
             _ => {}
         }
+    }
+
+    fn toggle_in_group(&mut self, id: EntityId) {
+        if !self.group.remove(&id) {
+            self.group.insert(id);
+        }
+        self.redraw_selection(&[id]);
+    }
+
+    fn clear_group(&mut self) {
+        let was: Vec<EntityId> = std::mem::take(&mut self.group).into_iter().collect();
+        if !was.is_empty() {
+            self.redraw_selection(&was);
+        }
+    }
+
+    /// The pointer moved with the button down.
+    fn drag_to(&mut self, to: (u16, u16)) {
+        if let Drag::Pending { at, grab } = self.drag.clone() {
+            if at == to {
+                return;
+            }
+            self.drag = match grab {
+                Grab::Nothing => Drag::Marquee { from: at, to },
+                Grab::Leaf(id) | Grab::Box(id) => {
+                    let moved: Vec<EntityId> = match grab {
+                        Grab::Leaf(id) if self.group.contains(&id) => {
+                            self.group.iter().copied().collect()
+                        }
+                        _ => vec![id],
+                    };
+                    // The level of every moved node, and every level above
+                    // it: the boxes that grow to hold the move are at those.
+                    let mut levels = std::collections::BTreeSet::new();
+                    for &id in &moved {
+                        let mut level = self.scene.parent.get(&id).copied();
+                        loop {
+                            levels.insert(level);
+                            match level {
+                                Some(c) => level = self.scene.parent.get(&c).copied(),
+                                None => break,
+                            }
+                        }
+                    }
+                    let corner = self.camera.unclamped_at(at.0, at.1);
+                    let rect = self.diagram.rect_of(id).unwrap_or_default();
+                    let held = (id, (corner.0 - i32::from(rect.x), corner.1 - i32::from(rect.y)));
+                    Drag::Moving { last: at, moved, levels, held }
+                }
+            };
+        }
+        match &mut self.drag {
+            Drag::Marquee { to: end, .. } => *end = to,
+            Drag::Moving { last, moved, levels, held } => {
+                let by = (i32::from(to.0) - i32::from(last.0), i32::from(to.1) - i32::from(last.1));
+                *last = to;
+                let (moved, levels, held) = (moved.clone(), levels.clone(), *held);
+                self.layout.nudge(&moved, by, self.zoom);
+                let opts = Options { anchored: moved.into_iter().collect(), loose: levels };
+                let anchor = Anchor::Node { id: held.0, corner: held.1, screen: (i32::from(to.0), i32::from(to.1)) };
+                self.rebuild_with(anchor, &opts);
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll so the held node's corner sits where it was relative to the
+    /// pointer. Everything that did not move then stays where it was on
+    /// screen, whatever the canvas did to its own origin.
+    fn hold_under_pointer(&mut self, held: (EntityId, (i32, i32)), pointer: (i32, i32)) {
+        let Some(rect) = self.diagram.rect_of(held.0) else { return };
+        let v = self.camera.viewport;
+        self.camera.offset = (
+            i32::from(rect.x) + held.1.0 - (pointer.0 - i32::from(v.x)),
+            i32::from(rect.y) + held.1.1 - (pointer.1 - i32::from(v.y)),
+        );
+        self.camera.clamp();
+    }
+
+    /// The button came up.
+    fn drop_at(&mut self, at: (u16, u16)) {
+        match std::mem::replace(&mut self.drag, Drag::Idle) {
+            // The siblings make way now, and where everything lands is the
+            // arrangement from here on.
+            Drag::Moving { moved, held, .. } => {
+                let opts = Options { anchored: moved.into_iter().collect(), loose: Default::default() };
+                let anchor = Anchor::Node { id: held.0, corner: held.1, screen: (i32::from(at.0), i32::from(at.1)) };
+                self.rebuild_with(anchor, &opts);
+            }
+            Drag::Marquee { from, .. } => {
+                let (a, b) = (self.camera.unclamped_at(from.0, from.1), self.camera.unclamped_at(at.0, at.1));
+                let (x0, x1) = (a.0.min(b.0).max(0), a.0.max(b.0).max(0));
+                let (y0, y1) = (a.1.min(b.1).max(0), a.1.max(b.1).max(0));
+                let swept = Rect::new(x0 as u16, y0 as u16, (x1 - x0 + 1) as u16, (y1 - y0 + 1) as u16);
+                let mut chosen: Vec<(EntityId, Rect)> = self
+                    .diagram
+                    .leaves_in(swept)
+                    .into_iter()
+                    .filter_map(|id| Some((id, self.diagram.rect_of(id)?)))
+                    .collect();
+                chosen.sort_by_key(|(_, r)| (r.y, r.x));
+                let was: Vec<EntityId> = std::mem::take(&mut self.group).into_iter().collect();
+                self.group = chosen.iter().map(|(id, _)| *id).collect();
+                let mut changed: Vec<EntityId> = was;
+                changed.extend(self.group.iter().copied());
+                self.redraw_selection(&changed);
+                if let Some((first, _)) = chosen.first() {
+                    self.select(*first);
+                }
+            }
+            Drag::Pending { .. } | Drag::Idle => {}
+        }
+    }
+
+    /// Where the marquee is on screen, while one is being swept.
+    fn marquee(&self) -> Option<Rect> {
+        let Drag::Marquee { from, to } = self.drag else { return None };
+        let (x0, x1) = (from.0.min(to.0), from.0.max(to.0));
+        let (y0, y1) = (from.1.min(to.1), from.1.max(to.1));
+        Some(Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1))
     }
 
     fn leaf_under(&self, col: u16, row: u16) -> Option<EntityId> {
@@ -782,18 +1098,24 @@ impl App {
     fn status(&self) -> Line<'static> {
         let leaves = self.diagram.nodes.iter().filter(|n| !n.is_box).count();
         let boxes = self.diagram.nodes.len() - leaves;
-        let drawn = self.stats.submitted - self.stats.unroutable;
+        let stats = &self.rendered.stats;
         let mut spans = vec![
             Span::styled(
                 format!(" {leaves} nodes in {boxes} boxes "),
                 Style::default().fg(Color::Black).bg(Color::Cyan),
             ),
-            Span::raw(format!(" {drawn}/{} edges ", self.stats.submitted)),
+            Span::raw(format!(" {} edges ", stats.submitted)),
         ];
-        if self.stats.unroutable > 0 {
+        if stats.unroutable > 0 {
             spans.push(Span::styled(
-                format!("({} unroutable) ", self.stats.unroutable),
-                Style::default().fg(Color::Red),
+                format!("({} cross something) ", stats.unroutable),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if !self.group.is_empty() {
+            spans.push(Span::styled(
+                format!("· {} grouped ", self.group.len()),
+                Style::default().fg(Color::Cyan),
             ));
         }
         spans.push(Span::styled(
@@ -923,10 +1245,28 @@ impl App {
             KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
                 self.pending_window = true
             }
-            KeyCode::Up | KeyCode::Char('k') => self.camera.scroll(0, -1),
-            KeyCode::Down | KeyCode::Char('j') => self.camera.scroll(0, 1),
-            KeyCode::Left | KeyCode::Char('h') => self.camera.scroll(-4, 0),
-            KeyCode::Right | KeyCode::Char('l') => self.camera.scroll(4, 0),
+            // The arrows are the focus; with shift they pan, with control
+            // they carry the focused node along. A step is one row or two
+            // columns, the same distance on screen either way.
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                let dir = match code {
+                    KeyCode::Up => (0, -1),
+                    KeyCode::Down => (0, 1),
+                    KeyCode::Left => (-1, 0),
+                    _ => (1, 0),
+                };
+                if mods.contains(KeyModifiers::CONTROL) {
+                    self.shove((dir.0 * 2, dir.1));
+                } else if mods.contains(KeyModifiers::SHIFT) {
+                    self.camera.scroll(dir.0 * 4, dir.1);
+                } else {
+                    self.move_focus(dir);
+                }
+            }
+            KeyCode::Char('k') => self.camera.scroll(0, -1),
+            KeyCode::Char('j') => self.camera.scroll(0, 1),
+            KeyCode::Char('h') => self.camera.scroll(-4, 0),
+            KeyCode::Char('l') => self.camera.scroll(4, 0),
             KeyCode::PageUp => self.camera.scroll(0, -page),
             KeyCode::PageDown | KeyCode::Char(' ') => self.camera.scroll(0, page),
             // Back to the beginning is the same place the view opens at, so
@@ -934,8 +1274,10 @@ impl App {
             // the start of a diagram narrower than the screen is.
             KeyCode::Home | KeyCode::Char('g') | KeyCode::Char('c') => self.camera.center(),
             KeyCode::End | KeyCode::Char('G') => self.camera.bottom(),
-            KeyCode::Tab | KeyCode::Char('n') => self.step_selection(true),
-            KeyCode::BackTab | KeyCode::Char('p') => self.step_selection(false),
+            KeyCode::Tab => self.focus_in(),
+            KeyCode::BackTab => self.focus_out(),
+            KeyCode::Char('n') => self.step_selection(true),
+            KeyCode::Char('p') => self.step_selection(false),
             KeyCode::Enter | KeyCode::Char('+') => self.expand(),
             KeyCode::Backspace | KeyCode::Char('-') => self.collapse(),
             KeyCode::Char(c) if controls::for_key(c).is_some() => {
@@ -1103,6 +1445,25 @@ fn restore() {
     ratatui::restore();
 }
 
+/// The sweep in progress: a dotted outline, so what it will take in is
+/// visible before the button comes up.
+fn draw_marquee(buf: &mut Buffer, r: Rect) {
+    if r.width == 0 || r.height == 0 {
+        return;
+    }
+    let st = Style::default().fg(Color::Cyan);
+    for x in r.x..r.right() {
+        for y in [r.y, r.bottom() - 1] {
+            buf[(x, y)].set_symbol("┄").set_style(st);
+        }
+    }
+    for y in r.y..r.bottom() {
+        for x in [r.x, r.right() - 1] {
+            buf[(x, y)].set_symbol("┆").set_style(st);
+        }
+    }
+}
+
 fn draw_keys(frame: &mut ratatui::Frame, area: Rect) {
     // Sized from the longest line rather than a guess: a fixed width silently
     // clipped the ends of the descriptions, which is the one thing this panel
@@ -1140,12 +1501,14 @@ fn draw_keys(frame: &mut ratatui::Frame, area: Rect) {
     );
 }
 
-/// Did the user mean something by it? Moving the pointer, letting a button up
-/// and dragging are all reported and all mean nothing here.
+/// Did the user mean something by it? Moving the pointer with no button down
+/// is reported too, and means nothing here.
 fn is_gesture(kind: MouseEventKind) -> bool {
     matches!(
         kind,
         MouseEventKind::Down(_)
+            | MouseEventKind::Drag(_)
+            | MouseEventKind::Up(_)
             | MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
@@ -1186,18 +1549,15 @@ where
         let (graph, pane) = editor::panes(app.body, app.editor.as_ref().map(Editor::width));
 
         if graph.width > 0 && graph != app.camera.viewport {
-            // Only width feeds the layout -- it is what a rank wraps
-            // against. A change in height just shows more of the same
-            // diagram, and re-routing every edge to learn that would cost
-            // seconds on every drag of a window corner.
-            let relaid = graph.width != app.camera.viewport.width;
+            // Positions persist, so a window that changed size shows more
+            // or less of the same picture rather than a new one.
             app.camera.resize(graph);
-            if relaid {
-                app.rebuild();
-            }
         }
         if graph.width > 0 {
             render::blit(&app.canvas, frame.buffer_mut(), graph, app.camera.offset);
+            if let Some(m) = app.marquee() {
+                draw_marquee(frame.buffer_mut(), m.intersection(graph));
+            }
             // Drawn after the diagram and remembered, because the click that
             // works a switch arrives after the frame that showed it.
             app.panel = controls::draw(frame.buffer_mut(), graph, |c| app.state(c));
@@ -1244,7 +1604,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use entity_graph::EntityKind::{File, Folder};
+    use entity_graph::EntityKind::{File, Folder, Function};
     use entity_graph::ReferenceKind::Call;
     use entity_graph::test_support::graph_from_parents;
 
@@ -1376,12 +1736,11 @@ mod tests {
         assert_eq!(app.zoom, Zoom::Far);
     }
 
-    /// Expanding a node is a step *into* it, so the selection has to come out
-    /// the other side inside it. It did not: the node became a box, the
-    /// invariant repair fell back to the diagram's first leaf, and every
-    /// expand threw the user back to the top left.
+    /// Expanding changes what is in the picture, not where the focus is: the
+    /// node opens into a box and stays focused, and tab is the step inside.
+    /// It once threw the focus back to the diagram's first leaf instead.
     #[test]
-    fn expanding_a_node_selects_something_inside_it() {
+    fn expanding_a_node_keeps_it_focused_and_tab_goes_inside() {
         let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
             ("root", Folder, None),
             ("left", Folder, Some(0)),
@@ -1401,15 +1760,14 @@ mod tests {
         assert_eq!(app.selected, Some(right));
 
         app.key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(right), "expanding moved the focus off the node that was opened");
+        assert!(
+            app.diagram.nodes.iter().any(|n| n.is_box && n.id == right),
+            "the opened node is not drawn as a box"
+        );
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
         let now = app.selected.expect("something is selected");
-        assert!(
-            is_under(&app.graph, now, right),
-            "expanding `right` selected {now:?}, which is not inside it"
-        );
-        assert!(
-            app.diagram.nodes.iter().any(|n| !n.is_box && n.id == now),
-            "the selection is not a drawn leaf"
-        );
+        assert!(is_under(&app.graph, now, right) && now != right, "tab did not go into the opened box");
     }
 
     /// Zooming is the one relayout where the picture does not change, so what
@@ -1489,19 +1847,363 @@ mod tests {
         assert!(!app.diagram.nodes.iter().any(|n| n.id == id), "the × button did not hide the box");
     }
 
+    fn press_at(app: &mut App, col: u16, row: u16) {
+        app.mouse(wheel(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE, col, row));
+    }
+
+    fn drag_to(app: &mut App, col: u16, row: u16) {
+        app.mouse(wheel(MouseEventKind::Drag(MouseButton::Left), KeyModifiers::NONE, col, row));
+    }
+
+    fn release_at(app: &mut App, col: u16, row: u16) {
+        app.mouse(wheel(MouseEventKind::Up(MouseButton::Left), KeyModifiers::NONE, col, row));
+    }
+
+    /// The screen cell over a diagram cell.
+    fn screen(app: &App, x: u16, y: u16) -> (u16, u16) {
+        (
+            (i32::from(x) - app.camera.offset.0 + i32::from(app.camera.viewport.x)) as u16,
+            (i32::from(y) - app.camera.offset.1 + i32::from(app.camera.viewport.y)) as u16,
+        )
+    }
+
+    /// Opening a node grows it down and right from where it is, on the
+    /// canvas and on the screen alike. What is beside it makes way along
+    /// the row; what is left of it does not move at all. Then closing it
+    /// shrinks it in place and moves nothing else.
     #[test]
-    fn tab_walks_every_leaf_and_comes_back_round() {
+    fn expanding_a_node_keeps_it_and_what_is_left_of_it_where_they_were() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+            ("c.rs", File, Some(0)),
+            ("f", Function, Some(2)),
+            ("g", Function, Some(2)),
+            ("h", Function, Some(2)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 120, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        let (a, b, c) = (EntityId(1), EntityId(2), EntityId(3));
+        app.select(b);
+        let rect = |app: &App, id| app.diagram.rect_of(id).unwrap();
+        let (a_was, b_was, c_was) = (rect(&app, a), rect(&app, b), rect(&app, c));
+        assert!(a_was.y == b_was.y && b_was.y == c_was.y, "fixture: a row");
+        assert!(a_was.right() < b_was.x && b_was.right() < c_was.x, "fixture: a, b, c in order");
+        let b_screen = screen(&app, b_was.x, b_was.y);
+
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        let (a_now, b_now, c_now) = (rect(&app, a), rect(&app, b), rect(&app, c));
+        assert!(app.diagram.nodes.iter().any(|n| n.id == b && n.is_box), "b should be a box");
+        assert!(b_now.width > b_was.width && b_now.height > b_was.height, "b did not grow");
+        assert_eq!((b_now.x, b_now.y), (b_was.x, b_was.y), "the opened node moved on the canvas");
+        assert_eq!(screen(&app, b_now.x, b_now.y), b_screen, "the opened node moved on the screen");
+        assert_eq!(a_now, a_was, "a, left of the opened node, moved");
+        assert_eq!(c_now.y, c_was.y, "c was pushed out of its row");
+        assert!(c_now.x >= b_now.right(), "c did not make way");
+
+        app.select(EntityId(4));
+        app.key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(rect(&app, b), b_was, "closing did not put b back as it was");
+        assert_eq!(rect(&app, a), a_was);
+        assert_eq!(rect(&app, c), c_now, "closing moved c, which the user never touched");
+    }
+
+    /// Dragging a node moves it by what the pointer moved, the edges come
+    /// with it, and it stays there afterwards -- through a zoom and back.
+    /// The node under the pointer holds still on screen while everything
+    /// else does too, which is the whole point of a drag.
+    #[test]
+    fn dragging_a_leaf_moves_it_and_keeps_it_there() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+            ("c.rs", File, Some(0)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[(1, 2, Call)]), Rect::new(0, 0, 80, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> a, b, c
+        let (a, c) = (EntityId(1), EntityId(3));
+        let a_was = app.diagram.rect_of(a).unwrap();
+        let c_was = app.diagram.rect_of(c).unwrap();
+        let grab = screen(&app, a_was.x + 1, a_was.y + 1);
+
+        press_at(&mut app, grab.0, grab.1);
+        assert_eq!(app.selected, Some(a), "pressing a node selects it");
+        let c_screen_was = screen(&app, c_was.x, c_was.y);
+        drag_to(&mut app, grab.0 + 5, grab.1 + 12);
+        assert!(matches!(app.drag, Drag::Moving { .. }));
+        // In flight, the node is under the pointer where it was grabbed, and
+        // the one that was not touched has not moved on screen -- whatever
+        // the canvas did to its own origin underneath.
+        let a_now = app.diagram.rect_of(a).unwrap();
+        assert_eq!(screen(&app, a_now.x + 1, a_now.y + 1), (grab.0 + 5, grab.1 + 12), "the node left the pointer");
+        let c_now = app.diagram.rect_of(c).unwrap();
+        assert_eq!(screen(&app, c_now.x, c_now.y), c_screen_was, "an unmoved node moved on screen");
+
+        release_at(&mut app, grab.0 + 5, grab.1 + 12);
+        assert_eq!(app.drag, Drag::Idle);
+        let a_dropped = app.diagram.rect_of(a).unwrap();
+        let c_dropped = app.diagram.rect_of(c).unwrap();
+        let apart = |p: Rect, q: Rect| (i32::from(p.x) - i32::from(q.x), i32::from(p.y) - i32::from(q.y));
+        let was = apart(a_was, c_was);
+        assert_eq!(apart(a_dropped, c_dropped), (was.0 + 5, was.1 + 12), "the drop did not land where the pointer let go");
+        // The edge a -> b came along: an arrowhead still touches b's frame.
+        // Which side depends on where a landed, so any side counts.
+        let b = app.diagram.rect_of(EntityId(2)).unwrap();
+        let ring = (b.x - 1..=b.right())
+            .flat_map(|x| [(x, b.y - 1), (x, b.bottom())])
+            .chain((b.y..b.bottom()).flat_map(|y| [(b.x - 1, y), (b.right(), y)]));
+        let heads = ring.filter(|&p| matches!(app.canvas[p].symbol(), "▼" | "▲" | "◀" | "▶")).count();
+        assert_eq!(heads, 1, "the edge did not follow the drag");
+
+        // Zoom out and back in: the arrangement is the user's now, and it holds.
+        app.control(Control::Zoom);
+        app.control(Control::Zoom);
+        app.control(Control::Zoom);
+        assert_eq!(app.zoom, Zoom::Close);
+        assert_eq!(apart(app.diagram.rect_of(a).unwrap(), app.diagram.rect_of(c).unwrap()), (was.0 + 5, was.1 + 12));
+
+        // Control: with nothing dragged, a click does not move anything.
+        let before: Vec<_> = app.diagram.nodes.iter().map(|n| (n.id, n.rect)).collect();
+        let cs = screen(&app, c_dropped.x + 1, c_dropped.y + 1);
+        press_at(&mut app, cs.0, cs.1);
+        release_at(&mut app, cs.0, cs.1);
+        let after: Vec<_> = app.diagram.nodes.iter().map(|n| (n.id, n.rect)).collect();
+        assert_eq!(before, after);
+    }
+
+    /// Dropping a node on a sibling does not leave them on top of each
+    /// other: the sibling makes way, and the dropped one stays where it
+    /// was put.
+    #[test]
+    fn a_node_dropped_on_another_pushes_it_aside() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 80, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        let (a, b) = (EntityId(1), EntityId(2));
+        let (a_was, b_was) = (app.diagram.rect_of(a).unwrap(), app.diagram.rect_of(b).unwrap());
+        assert_eq!(a_was.y, b_was.y, "fixture: side by side");
+        let grab = screen(&app, a_was.x + 1, a_was.y + 1);
+        let dx = i32::from(b_was.x) - i32::from(a_was.x);
+        press_at(&mut app, grab.0, grab.1);
+        drag_to(&mut app, (i32::from(grab.0) + dx) as u16, grab.1);
+        let a_flight = app.diagram.rect_of(a).unwrap();
+        let b_flight = app.diagram.rect_of(b).unwrap();
+        assert!(a_flight.intersects(b_flight), "in flight the two may overlap; nothing is pushed yet");
+        release_at(&mut app, (i32::from(grab.0) + dx) as u16, grab.1);
+        let a_now = app.diagram.rect_of(a).unwrap();
+        let b_now = app.diagram.rect_of(b).unwrap();
+        assert!(!a_now.intersects(b_now), "the drop left two nodes on top of each other");
+        assert_eq!(screen(&app, a_now.x + 1, a_now.y + 1), ((i32::from(grab.0) + dx) as u16, grab.1), "the dropped node was the one pushed");
+    }
+
+    /// Sweeping a rectangle over some leaves makes them a group; dragging
+    /// one of them then moves them all, and shift-click takes one out.
+    #[test]
+    fn a_marquee_gathers_a_group_that_moves_together() {
         let mut app = app();
-        let leaves = app.diagram.nodes.iter().filter(|n| !n.is_box).count();
-        assert!(leaves >= 2, "fixture should draw several leaves");
+        let mut leaves: Vec<Rect> = app.diagram.nodes.iter().filter(|n| !n.is_box).map(|n| n.rect).collect();
+        leaves.sort_by_key(|r| (r.y, r.x));
+        assert!(leaves.len() >= 3);
+        // Sweep from the empty row under the first row up through it. The
+        // row above is the box's title, which is a handle, not nothing.
+        let row_y = leaves[0].y;
+        let in_row: Vec<Rect> = leaves.iter().copied().filter(|r| r.y == row_y).collect();
+        assert!(in_row.len() >= 2, "fixture: a row with several leaves");
+        let (first, last) = (in_row[0], in_row[in_row.len() - 1]);
+        assert_eq!(app.diagram.leaf_at((first.x, first.bottom())), None, "fixture: a free row under the leaves");
+        let from = screen(&app, first.x, first.bottom());
+        let to = screen(&app, last.right() - 1, last.y + 1);
+        press_at(&mut app, from.0, from.1);
+        drag_to(&mut app, to.0, to.1);
+        assert!(matches!(app.drag, Drag::Marquee { .. }), "a drag on nothing should sweep");
+        assert!(app.marquee().is_some());
+        release_at(&mut app, to.0, to.1);
+        let group: Vec<EntityId> = app.group.iter().copied().collect();
+        assert_eq!(group.len(), in_row.len(), "the sweep should take exactly the row");
+        for r in &in_row {
+            assert!(group.contains(&app.diagram.leaf_at((r.x + 1, r.y + 1)).unwrap()));
+        }
+
+        // Drag one member: they all move by the same amount, measured against
+        // a leaf that stayed put -- the canvas re-homes itself on its own
+        // top-left, so absolute coordinates say nothing.
+        let ids: Vec<EntityId> = in_row.iter().map(|r| app.diagram.leaf_at((r.x + 1, r.y + 1)).unwrap()).collect();
+        let other = leaves.iter().find(|r| r.y != row_y).expect("fixture: another row");
+        let other_id = app.diagram.leaf_at((other.x + 1, other.y + 1)).unwrap();
+        let rel = |app: &App, id: EntityId| {
+            let (r, o) = (app.diagram.rect_of(id).unwrap(), app.diagram.rect_of(other_id).unwrap());
+            (i32::from(r.x) - i32::from(o.x), i32::from(r.y) - i32::from(o.y))
+        };
+        let before: Vec<(i32, i32)> = ids.iter().map(|id| rel(&app, *id)).collect();
+        let first = app.diagram.rect_of(ids[0]).unwrap();
+        let grab = screen(&app, first.x + 1, first.y + 1);
+        press_at(&mut app, grab.0, grab.1);
+        drag_to(&mut app, grab.0, grab.1 + 3);
+        release_at(&mut app, grab.0, grab.1 + 3);
+        for (id, b) in ids.iter().zip(&before) {
+            assert_eq!(rel(&app, *id), (b.0, b.1 + 3), "a group member did not move with the group");
+        }
+        assert_eq!(app.group.len(), in_row.len(), "dragging the group should keep it");
+
+        // Shift-click takes one out; a plain click elsewhere drops the group.
+        let out = app.diagram.rect_of(ids[0]).unwrap();
+        let at = screen(&app, out.x + 1, out.y + 1);
+        app.mouse(wheel(MouseEventKind::Down(MouseButton::Left), KeyModifiers::SHIFT, at.0, at.1));
+        release_at(&mut app, at.0, at.1);
+        assert!(!app.group.contains(&ids[0]));
+        assert_eq!(app.group.len(), in_row.len() - 1);
+        let other = app.diagram.rect_of(other_id).unwrap();
+        let at = screen(&app, other.x + 1, other.y + 1);
+        press_at(&mut app, at.0, at.1);
+        release_at(&mut app, at.0, at.1);
+        assert!(app.group.is_empty(), "clicking outside the group should let it go");
+    }
+
+    /// A box is dragged by its title rows and everything in it comes along.
+    #[test]
+    fn dragging_a_box_by_its_title_moves_what_is_in_it() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("left", Folder, Some(0)),
+            ("right", Folder, Some(0)),
+            ("a.rs", File, Some(1)),
+            ("b.rs", File, Some(2)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 100, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        app.select(EntityId(1));
+        app.key(KeyCode::Enter, KeyModifiers::NONE); // left -> a.rs
+        let (left, a) = (EntityId(1), EntityId(3));
+        let left_was = app.diagram.rect_of(left).unwrap();
+        let a_was = app.diagram.rect_of(a).unwrap();
+        let right_was = app.diagram.rect_of(EntityId(2)).unwrap();
+        let grab = screen(&app, left_was.x + 1, left_was.y + 1);
+        press_at(&mut app, grab.0, grab.1);
+        assert!(matches!(app.drag, Drag::Pending { grab: Grab::Box(id), .. } if id == left));
+        drag_to(&mut app, grab.0, grab.1 + 6);
+        release_at(&mut app, grab.0, grab.1 + 6);
+        let left_now = app.diagram.rect_of(left).unwrap();
+        let a_now = app.diagram.rect_of(a).unwrap();
+        assert_eq!(
+            (i32::from(a_now.x) - i32::from(left_now.x), i32::from(a_now.y) - i32::from(left_now.y)),
+            (i32::from(a_was.x) - i32::from(left_was.x), i32::from(a_was.y) - i32::from(left_was.y)),
+            "the child did not come with its box"
+        );
+        let right_now = app.diagram.rect_of(EntityId(2)).unwrap();
+        assert_eq!(
+            i32::from(left_now.y) - i32::from(right_now.y),
+            i32::from(left_was.y) - i32::from(right_was.y) + 6,
+            "the box did not move by the drag relative to its sibling"
+        );
+    }
+
+    /// `L` forgets the arrangement: a dragged node goes back to where the
+    /// ranking puts it.
+    #[test]
+    fn relayout_undoes_a_drag() {
+        let mut app = app();
+        let leaf = app.diagram.nodes.iter().find(|n| !n.is_box).unwrap();
+        let (id, rect) = (leaf.id, leaf.rect);
+        let fresh: Vec<_> = app.diagram.nodes.iter().map(|n| (n.id, n.rect)).collect();
+        let grab = screen(&app, rect.x + 1, rect.y + 1);
+        press_at(&mut app, grab.0, grab.1);
+        drag_to(&mut app, grab.0 + 3, grab.1 + 8);
+        release_at(&mut app, grab.0 + 3, grab.1 + 8);
+        assert_ne!(app.diagram.rect_of(id).unwrap(), rect);
+        app.key(KeyCode::Char('L'), KeyModifiers::NONE);
+        let again: Vec<_> = app.diagram.nodes.iter().map(|n| (n.id, n.rect)).collect();
+        assert_eq!(fresh, again, "re-layout did not restore the ranked picture");
+    }
+
+    #[test]
+    fn n_walks_every_node_boxes_included_and_comes_back_round() {
+        let mut app = app();
+        let nodes = app.diagram.nodes.len();
+        assert!(nodes >= 2, "fixture should draw several nodes");
         let first = app.selected.expect("something is selected at rest");
         let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..leaves {
+        for _ in 0..nodes {
             seen.insert(app.selected.unwrap());
-            app.key(KeyCode::Tab, KeyModifiers::NONE);
+            app.key(KeyCode::Char('n'), KeyModifiers::NONE);
         }
-        assert_eq!(seen.len(), leaves, "tab skipped a leaf");
-        assert_eq!(app.selected, Some(first), "tab did not wrap around");
+        assert_eq!(seen.len(), nodes, "n skipped a node");
+        assert_eq!(app.selected, Some(first), "n did not wrap around");
+    }
+
+    /// The arrows walk the siblings of a level by where they are drawn; tab
+    /// and shift-tab step through the containment, so a box is a thing the
+    /// focus can rest on.
+    #[test]
+    fn arrows_walk_siblings_and_tab_goes_in_and_out_of_boxes() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+            ("c.rs", File, Some(0)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 80, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> a, b, c in one row
+        let (root, a, b, c) = (EntityId(0), EntityId(1), EntityId(2), EntityId(3));
+        let x = |app: &App, id| app.diagram.rect_of(id).unwrap().x;
+        assert!(x(&app, a) < x(&app, b) && x(&app, b) < x(&app, c), "fixture should rank a b c along a row");
+
+        app.key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(root), "shift-tab did not focus the box around");
+        app.key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(root), "there is nothing outside the root");
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(a), "tab did not go to the first child");
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(a), "a leaf has nothing to go into");
+
+        app.key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(b));
+        app.key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(c));
+        app.key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(c), "nothing is right of the last one");
+        app.key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(b));
+        app.key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(b), "nothing is below a one-row level");
+
+        let offset = app.camera.offset;
+        app.key(KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(app.selected, Some(b), "shift-arrow moved the focus");
+        assert_ne!(app.camera.offset, offset, "shift-arrow did not scroll");
+    }
+
+    /// Control-arrow is a drag by keyboard: the node lands a step over, the
+    /// rest stay, and the screen does not lurch under the reader.
+    #[test]
+    fn ctrl_arrow_moves_the_focused_node_and_nothing_else() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 80, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        let (a, b) = (EntityId(1), EntityId(2));
+        app.select(a);
+        let (a_was, b_was) = (app.diagram.rect_of(a).unwrap(), app.diagram.rect_of(b).unwrap());
+        let a_screen = screen(&app, a_was.x, a_was.y);
+        let b_screen = screen(&app, b_was.x, b_was.y);
+
+        app.key(KeyCode::Down, KeyModifiers::CONTROL);
+        let (a_now, b_now) = (app.diagram.rect_of(a).unwrap(), app.diagram.rect_of(b).unwrap());
+        let apart = |p: Rect, q: Rect| (i32::from(p.x) - i32::from(q.x), i32::from(p.y) - i32::from(q.y));
+        let was = apart(a_was, b_was);
+        assert_eq!(apart(a_now, b_now), (was.0, was.1 + 1), "the node did not move one row down");
+        assert_eq!(screen(&app, a_now.x, a_now.y), (a_screen.0, a_screen.1 + 1), "the node did not move on screen by the step");
+        assert_eq!(screen(&app, b_now.x, b_now.y), b_screen, "the other node moved on screen");
+        assert_eq!(app.selected, Some(a));
     }
 
     #[test]
@@ -1530,12 +2232,20 @@ mod tests {
         app.diagram.nodes.iter().any(|n| n.id == id)
     }
 
+    /// At rest the fixture's focus is on the root, which is a box once it is
+    /// expanded; hiding or scoping to that would act on the whole picture.
+    fn focus_a_leaf(app: &mut App) -> EntityId {
+        let leaf = app.diagram.nodes.iter().find(|n| !n.is_box).expect("a drawn leaf").id;
+        app.select(leaf);
+        leaf
+    }
+
     /// Hiding is the switch a user reaches for most, and `show all` is the
     /// only way back from it -- so they are tested as the pair they are.
     #[test]
     fn hiding_the_selection_takes_it_out_until_show_all_brings_it_back() {
         let mut app = app();
-        let gone = app.selected.expect("something is selected at rest");
+        let gone = focus_a_leaf(&mut app);
         app.key(KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(!drawn(&app, gone), "x did not hide the selected node");
         assert!(app.diagram.nodes.iter().any(|n| !n.is_box), "x hid everything");
@@ -1547,7 +2257,7 @@ mod tests {
     #[test]
     fn scoping_keeps_only_the_selection_and_show_all_undoes_it() {
         let mut app = app();
-        let kept = app.selected.expect("something is selected at rest");
+        let kept = focus_a_leaf(&mut app);
         app.key(KeyCode::Char('s'), KeyModifiers::NONE);
         let leaves: Vec<EntityId> =
             app.diagram.nodes.iter().filter(|n| !n.is_box).map(|n| n.id).collect();
@@ -1598,6 +2308,11 @@ mod tests {
         // Not the user's own nvim: a config that opens a dashboard, or makes
         // a fresh buffer unmodifiable, would decide whether these pass.
         app.nvim_args = &["--clean"];
+        // One nvim starts at a time. Several started together by parallel
+        // tests would, about one run in three, include one that never
+        // answered its first request; alone or in turn they always do.
+        static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one_at_a_time = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         app.control(Control::Editor);
         app
     }
@@ -1617,14 +2332,14 @@ mod tests {
 
         app.press(press(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.quit, "q quit the viewer while the user was typing in nvim");
-        app.press(press(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.selected, selected, "tab moved the diagram's selection");
+        app.press(press(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.selected, selected, "n moved the diagram's selection");
 
         app.press(press(KeyCode::Char('w'), KeyModifiers::CONTROL));
         app.press(press(KeyCode::Char('h'), KeyModifiers::NONE));
         assert_eq!(app.focus, Focus::Graph);
 
-        app.press(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.press(press(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_ne!(app.selected, selected, "the diagram never got the keyboard back");
     }
 

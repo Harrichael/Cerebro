@@ -24,6 +24,7 @@ pub enum Control {
     Scope,
     ShowAll,
     CollapseAll,
+    Relayout,
 }
 
 /// Key, control, label — in the order they are drawn.
@@ -37,6 +38,7 @@ const ROWS: &[(char, Control, &str)] = &[
     ('s', Control::Scope, "scope to node"),
     ('a', Control::ShowAll, "show all"),
     ('0', Control::CollapseAll, "collapse all"),
+    ('L', Control::Relayout, "re-layout"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
