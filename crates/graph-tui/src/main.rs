@@ -46,7 +46,7 @@ const WHEEL_X: i32 = 6;
 const KEYS: &[(&str, &str)] = &[
     ("↑ ↓ ← →", "move the focus to the nearest node that way, among its siblings"),
     ("tab  ⇧tab", "focus into a box, or out to the box around"),
-    ("ctrl-↑ ↓ ← →", "move the focused node -- or its group -- a step"),
+    ("⌥↑ ↓ ← →  /  ctrl-↑ ↓ ← →", "move the focused node -- or its group -- a step"),
     ("⇧↑ ↓ ← →  /  k j h l", "scroll"),
     ("PgUp PgDn  /  space", "scroll a half screen"),
     ("Home End  /  g G", "back to the start, or the bottom"),
@@ -1245,9 +1245,11 @@ impl App {
             KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
                 self.pending_window = true
             }
-            // The arrows are the focus; with shift they pan, with control
-            // they carry the focused node along. A step is one row or two
-            // columns, the same distance on screen either way.
+            // The arrows are the focus; with shift they pan, with option or
+            // control they carry the focused node along. Both, because macOS
+            // keeps ctrl-arrows for switching spaces and no terminal there
+            // ever sees them. A step is one row or two columns, the same
+            // distance on screen either way.
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
                 let dir = match code {
                     KeyCode::Up => (0, -1),
@@ -1255,7 +1257,7 @@ impl App {
                     KeyCode::Left => (-1, 0),
                     _ => (1, 0),
                 };
-                if mods.contains(KeyModifiers::CONTROL) {
+                if mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
                     self.shove((dir.0 * 2, dir.1));
                 } else if mods.contains(KeyModifiers::SHIFT) {
                     self.camera.scroll(dir.0 * 4, dir.1);
@@ -2179,7 +2181,7 @@ mod tests {
         assert_ne!(app.camera.offset, offset, "shift-arrow did not scroll");
     }
 
-    /// Control-arrow is a drag by keyboard: the node lands a step over, the
+    /// Option- or control-arrow is a drag by keyboard: the node lands a step over, the
     /// rest stay, and the screen does not lurch under the reader.
     #[test]
     fn ctrl_arrow_moves_the_focused_node_and_nothing_else() {
@@ -2204,6 +2206,16 @@ mod tests {
         assert_eq!(screen(&app, a_now.x, a_now.y), (a_screen.0, a_screen.1 + 1), "the node did not move on screen by the step");
         assert_eq!(screen(&app, b_now.x, b_now.y), b_screen, "the other node moved on screen");
         assert_eq!(app.selected, Some(a));
+
+        // Option-arrow is the same move: on a Mac, ctrl-arrow never arrives.
+        // Measured against the other node: `a` is the leftmost child, and
+        // the box hugs its children, so on the canvas it is the rest that
+        // shift; on screen, held by the camera, `a` is what moves.
+        let a_screen = screen(&app, a_now.x, a_now.y);
+        app.key(KeyCode::Right, KeyModifiers::ALT);
+        let (a_then, b_then) = (app.diagram.rect_of(a).unwrap(), app.diagram.rect_of(b).unwrap());
+        assert_eq!(apart(a_then, b_then), (was.0 + 2, was.1 + 1), "option-arrow did not move the node two columns");
+        assert_eq!(screen(&app, a_then.x, a_then.y), (a_screen.0 + 2, a_screen.1), "the node did not move right on screen");
     }
 
     #[test]
