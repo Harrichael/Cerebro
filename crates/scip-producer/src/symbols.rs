@@ -56,6 +56,47 @@ impl ParsedSymbol {
         })
     }
 
+    /// The word the indexer used for the symbol, for showing beside it. An
+    /// indexer that classifies nothing still says "method" through the
+    /// descriptor; whether a type is a class or an interface it cannot say.
+    pub fn noun(&self, kind: Kind) -> Option<&'static str> {
+        use Kind::*;
+        Some(match kind {
+            Function => "function",
+            Method | TraitMethod | SingletonMethod => "method",
+            StaticMethod => "static method",
+            AbstractMethod => "abstract method",
+            Constructor => "constructor",
+            Macro => "macro",
+            Getter => "getter",
+            Setter => "setter",
+            Accessor => "accessor",
+            Struct => "struct",
+            Class => "class",
+            Enum => "enum",
+            Trait => "trait",
+            Interface => "interface",
+            Type => "type",
+            TypeAlias => "type alias",
+            Union => "union",
+            Protocol => "protocol",
+            Object => "object",
+            Mixin => "mixin",
+            Delegate => "delegate",
+            Module => "module",
+            Namespace => "namespace",
+            Package => "package",
+            Library => "library",
+            UnspecifiedKind => match self.last_suffix()? {
+                Suffix::Method => "method",
+                Suffix::Macro => "macro",
+                Suffix::Namespace | Suffix::Package => "namespace",
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+
     /// Entity kind from the indexer's classification when it gives one,
     /// otherwise from the descriptor suffix. `None` means "not an entity"
     /// (fields, parameters, terms, ...).

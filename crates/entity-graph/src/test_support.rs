@@ -11,6 +11,7 @@ pub fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<Entit
     Entity {
         id: EntityId(id),
         kind,
+        noun: None,
         name: name.to_string(),
         parent,
         children: Vec::new(),

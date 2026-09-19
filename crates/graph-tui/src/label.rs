@@ -1,6 +1,6 @@
 //! What a node reads as.
 //!
-//! Both the placer and the renderer need this: one to size a box, the other to
+//! Both the layout and the renderer need this: one to size a box, the other to
 //! fill it, and a box sized from one string and filled with another truncates.
 //! The browser learned that the hard way and keeps its width estimate next to
 //! its label text for the same reason (`ui/common.js`, `leafSubText`).
@@ -54,7 +54,8 @@ impl<'a> Labels<'a> {
     /// view cannot say whether `parse` is a file, a class or a function.
     pub fn detail(&self, id: EntityId) -> String {
         let Some(e) = self.graph.get(id) else { return String::new() };
-        [kind_word(e.kind).to_string(), self.size(id), if e.is_test { "test".into() } else { String::new() }]
+        let word = e.noun.unwrap_or(kind_word(e.kind));
+        [word.to_string(), self.size(id), if e.is_test { "test".into() } else { String::new() }]
             .iter()
             .filter(|s| !s.is_empty())
             .cloned()

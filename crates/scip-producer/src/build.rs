@@ -124,6 +124,7 @@ impl<'a> Builder<'a> {
         self.entities.push(Entity {
             id,
             kind,
+            noun: None,
             name,
             parent,
             children: Vec::new(),
@@ -270,6 +271,7 @@ impl<'a> Builder<'a> {
                 };
                 let span = enclosing.unwrap_or(name_span);
                 let id = self.push(kind, name, None);
+                self.entities[id.0].noun = sym.noun(scip_kind);
                 if let Some(src) = &self.sources[d] {
                     self.entities[id.0].byte_range =
                         src.byte_offset(span.start)..src.byte_offset(span.end);

@@ -66,6 +66,7 @@ impl Builder<'_> {
         self.entities.push(Entity {
             id,
             kind: source.kind,
+            noun: source.noun,
             name: source.name.clone(),
             parent,
             children: Vec::new(),

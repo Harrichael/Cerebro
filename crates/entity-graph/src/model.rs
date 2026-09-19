@@ -84,6 +84,11 @@ pub struct Site {
 pub struct Entity {
     pub id: EntityId,
     pub kind: EntityKind,
+    /// What the language calls it -- `trait`, `interface`, `enum`,
+    /// `method` -- when the producer knows. `kind` is the role the entity
+    /// plays in the graph and is what code branches on; this is only ever
+    /// shown, so a language with a new noun costs nothing but the word.
+    pub noun: Option<&'static str>,
     pub name: String,
 
     // CONTAINMENT RELATIONS

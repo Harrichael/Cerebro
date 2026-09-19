@@ -127,6 +127,8 @@ struct ParsedFile {
 
 struct Construct {
     kind: NodeKind,
+    /// The grammar's own word for it; see [`noun_of`].
+    noun: Option<&'static str>,
     name: String,
     byte_range: (usize, usize),
     line_range: (usize, usize),
@@ -255,6 +257,7 @@ fn splice_file(
             depth + 1 + c.depth,
             Some(construct_id(file_id, c.parent)),
         );
+        tree.nodes[id].noun = c.noun;
         debug_assert_eq!(id, construct_id(file_id, Some(i)));
     }
     file_id
@@ -643,6 +646,7 @@ fn walk_ts_node(
             let index = out.len();
             out.push(Construct {
                 kind,
+                noun: noun_of(child.kind()),
                 name,
                 byte_range: (child.start_byte(), child.end_byte()),
                 line_range: (child.start_position().row, child.end_position().row),
@@ -729,6 +733,29 @@ fn classify_ts_node<'a>(node: &Node<'a>) -> Option<(NodeKind, Option<Node<'a>>)>
 
         _ => None,
     }
+}
+
+/// What the language calls a construct [`classify_ts_node`] accepted. Every
+/// type-like thing is a Class to the graph, but a reader shown "class" for a
+/// trait or an interface is told something false.
+fn noun_of(ts_kind: &str) -> Option<&'static str> {
+    Some(match ts_kind {
+        "function_item" | "function_signature_item" | "function_definition"
+        | "function_declaration" | "function" | "arrow_function" | "decorated_definition" => "function",
+        "method_definition" | "abstract_method_signature" | "method_signature" => "method",
+        "impl_item" => "impl",
+        "struct_item" => "struct",
+        "enum_item" | "enum_declaration" => "enum",
+        "trait_item" => "trait",
+        "mod_item" => "module",
+        "class_definition" | "class_declaration" | "class" => "class",
+        "interface_declaration" => "interface",
+        "type_alias_declaration" => "type alias",
+        "internal_module" => "namespace",
+        "create_table" => "table",
+        "create_view" => "view",
+        _ => return None,
+    })
 }
 
 /// Return the first named child whose `kind()` equals `kind_str`, if any.
@@ -896,6 +923,14 @@ namespace Utils {
             classes.iter().any(|n| n == "Animal"),
             "Expected 'Animal' interface: {classes:?}"
         );
+        // Every type-like thing is a Class to the graph, but each keeps the
+        // word the language uses for it.
+        let noun = |name: &str| tree.all_nodes_dfs().iter().find(|n| n.name == name).and_then(|n| n.noun);
+        assert_eq!(noun("Animal"), Some("interface"));
+        assert_eq!(noun("Dog"), Some("class"));
+        assert_eq!(noun("Direction"), Some("enum"));
+        assert_eq!(noun("greet"), Some("function"));
+        assert_eq!(noun("speak"), Some("method"));
     }
 
     #[test]

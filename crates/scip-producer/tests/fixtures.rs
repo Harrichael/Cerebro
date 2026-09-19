@@ -131,6 +131,13 @@ fn rust_fixture_maps_methods_under_their_struct_and_links_across_files() {
     .collect();
     assert_eq!(entity_set(&graph), expected);
 
+    // The indexer's own word for each entity comes along for showing.
+    let noun = |p: &str| graph.entities[id(&graph, p).0].noun;
+    assert_eq!(noun("rust/src/geometry.rs/Point"), Some("struct"));
+    assert_eq!(noun("rust/src/geometry.rs/Point/new"), Some("static method"));
+    assert_eq!(noun("rust/src/geometry.rs/Point/magnitude"), Some("method"));
+    assert_eq!(noun("rust/src/main.rs/main"), Some("function"));
+
     // Inherent and trait impls both hang off the type, not the file.
     assert_parent(
         &graph,
@@ -240,6 +247,11 @@ fn typescript_fixture_uses_utf16_columns_and_suffix_kinds() {
     .map(|(p, k)| (p.to_string(), k))
     .collect();
     assert_eq!(entity_set(&graph), expected);
+    // scip-typescript classifies nothing, so the descriptor is all there is
+    // to go on: it knows a method, and cannot tell a class from an interface.
+    let noun = |p: &str| graph.entities[id(&graph, p).0].noun;
+    assert_eq!(noun("ts/src/geometry.ts/Point"), None);
+    assert_eq!(noun("ts/src/geometry.ts/Point/magnitude"), Some("method"));
 
     assert_parent(
         &graph,

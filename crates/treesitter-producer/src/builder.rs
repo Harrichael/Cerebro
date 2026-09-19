@@ -106,6 +106,7 @@ pub fn code_tree_to_entity_graph(tree: &CodeTree) -> EntityGraph {
             entities.push(Entity {
                 id: entity_id,
                 kind,
+                noun: node.noun,
                 name: node.name.clone(),
                 parent: None,       // filled in pass 2
                 children: Vec::new(), // filled in pass 2

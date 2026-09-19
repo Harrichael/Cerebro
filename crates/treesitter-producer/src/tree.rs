@@ -166,6 +166,9 @@ pub struct CodeNode {
     /// Unique identifier within the tree (index into the flat arena).
     pub id: usize,
     pub kind: NodeKind,
+    /// The grammar's word for the construct, when it is one: `trait`,
+    /// `interface`, `method`. Shown, never branched on.
+    pub noun: Option<&'static str>,
     /// Display name (symbol name, file name, line content, …)
     pub name: String,
     /// Optional detail text shown in a secondary column.
@@ -200,6 +203,7 @@ impl CodeNode {
         CodeNode {
             id,
             kind,
+            noun: None,
             name: name.into(),
             detail: None,
             byte_range,
