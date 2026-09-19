@@ -14,11 +14,15 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::process::{ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
 use rmpv::Value;
+
+/// How long a request may go unanswered before it is given up on.
+const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
 /// A message that was not a reply: nvim's `redraw` batches, and whatever
 /// Lua sends back through `rpcnotify`.
@@ -77,10 +81,17 @@ impl Client {
             self.waiting.lock().expect("rpc waiting list").remove(&id);
             return Err(e);
         }
-        match rx.recv() {
+        // Bounded: an nvim that never answers -- seen, rarely, right after
+        // spawn -- would otherwise hold the caller for ever, and a caller on
+        // the main thread is the whole viewer.
+        match rx.recv_timeout(ANSWER_WITHIN) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(message)) => bail!("{method}: {message}"),
-            Err(_) => bail!("{method}: nvim went away before answering"),
+            Err(RecvTimeoutError::Timeout) => {
+                self.waiting.lock().expect("rpc waiting list").remove(&id);
+                bail!("{method}: nvim did not answer within {}s", ANSWER_WITHIN.as_secs())
+            }
+            Err(RecvTimeoutError::Disconnected) => bail!("{method}: nvim went away before answering"),
         }
     }
 
