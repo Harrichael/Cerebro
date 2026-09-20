@@ -1117,18 +1117,13 @@ impl App {
         let leaves = self.diagram.nodes.iter().filter(|n| !n.is_box).count();
         let boxes = self.diagram.nodes.len() - leaves;
         let stats = &self.rendered.stats;
-        let mut spans = Vec::new();
-        // The box the whole screen stands for has no title row of its own.
-        if let Some(name) = self.scene.canvas.and_then(|c| self.graph.get(c)).map(|e| e.name.as_str()) {
-            spans.push(Span::styled(format!(" {name} "), Style::default().fg(Color::Black).bg(Color::Blue)));
-        }
-        spans.extend([
+        let mut spans = vec![
             Span::styled(
                 format!(" {leaves} nodes in {boxes} boxes "),
                 Style::default().fg(Color::Black).bg(Color::Cyan),
             ),
             Span::raw(format!(" {} edges ", stats.submitted)),
-        ]);
+        ];
         if stats.unroutable > 0 {
             spans.push(Span::styled(
                 format!("({} cross something) ", stats.unroutable),
@@ -2163,31 +2158,25 @@ mod tests {
 
     /// The arrows walk the siblings of a level by where they are drawn; tab
     /// and shift-tab step through the containment, so a box is a thing the
-    /// focus can rest on. The root itself is the canvas, never a box, so the
-    /// folder under it is the box there is to go in and out of.
+    /// focus can rest on.
     #[test]
     fn arrows_walk_siblings_and_tab_goes_in_and_out_of_boxes() {
         let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
             ("root", Folder, None),
-            ("src", Folder, Some(0)),
-            ("a.rs", File, Some(1)),
-            ("b.rs", File, Some(1)),
-            ("c.rs", File, Some(1)),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+            ("c.rs", File, Some(0)),
         ];
         let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 80, 40));
-        app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> src, and root is the canvas
-        app.key(KeyCode::Enter, KeyModifiers::NONE); // src -> a, b, c in one row
-        let (src, a, b, c) = (EntityId(1), EntityId(2), EntityId(3), EntityId(4));
-        assert_eq!(app.selected, Some(src), "opening a box keeps the focus on it");
+        app.key(KeyCode::Enter, KeyModifiers::NONE); // root -> a, b, c in one row
+        let (root, a, b, c) = (EntityId(0), EntityId(1), EntityId(2), EntityId(3));
         let x = |app: &App, id| app.diagram.rect_of(id).unwrap().x;
         assert!(x(&app, a) < x(&app, b) && x(&app, b) < x(&app, c), "fixture should rank a b c along a row");
 
-        app.key(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(app.selected, Some(a), "tab did not go to the first child");
         app.key(KeyCode::BackTab, KeyModifiers::NONE);
-        assert_eq!(app.selected, Some(src), "shift-tab did not focus the box around");
+        assert_eq!(app.selected, Some(root), "shift-tab did not focus the box around");
         app.key(KeyCode::BackTab, KeyModifiers::NONE);
-        assert_eq!(app.selected, Some(src), "there is nothing outside the canvas");
+        assert_eq!(app.selected, Some(root), "there is nothing outside the root");
         app.key(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(app.selected, Some(a), "tab did not go to the first child");
         app.key(KeyCode::Tab, KeyModifiers::NONE);
