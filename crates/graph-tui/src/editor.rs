@@ -28,6 +28,9 @@ const PANE_MIN: u16 = 40;
 const GRAPH_MIN: u16 = 24;
 /// Columns one `ctrl-w <` or `ctrl-w >` moves the divider.
 const RESIZE_STEP: i32 = 4;
+/// Columns of code a pane opens with. Eighty is the width code is written
+/// to; a pane wider than that shows margin the diagram could have had.
+const CODE_COLUMNS: u16 = 80;
 /// What nvim calls back with after `:w`.
 pub const WROTE: &str = "cerebro_wrote";
 
@@ -161,6 +164,22 @@ impl Editor {
 
     pub fn width(&self) -> u16 {
         self.width
+    }
+
+    /// The width the pane would choose for itself: eighty columns of code
+    /// plus whatever nvim draws before them -- line numbers, signs, folds --
+    /// or `most` when the screen cannot spare that. Asked of nvim rather than
+    /// worked out from its options, because the user's config sets those and
+    /// may set them differently per file type.
+    pub fn natural_width(&self, most: u16) -> u16 {
+        let gutter = self
+            .nvim
+            .eval("getwininfo(win_getid())[0].textoff")
+            .ok()
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u16::try_from(n).ok())
+            .unwrap_or(0);
+        CODE_COLUMNS.saturating_add(gutter).min(most)
     }
 
     pub fn set_width(&mut self, width: u16) {
