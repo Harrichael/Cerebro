@@ -87,8 +87,22 @@ impl Camera {
         self.center();
     }
 
+    /// Adopt a viewport of a different size, keeping what was in the middle
+    /// of the view in the middle of it. Opening a pane takes the right half
+    /// of the screen; holding the top-left corner instead would keep the left
+    /// half of the picture, which is not the half anyone was looking at.
     pub fn resize(&mut self, viewport: Rect) {
+        let was = self.viewport;
         self.viewport = viewport;
+        // A viewport with no size has no middle to hold.
+        let held = |offset: i32, from: u16, to: u16| match from {
+            0 => offset,
+            from => offset + i32::from(from / 2) - i32::from(to / 2),
+        };
+        self.offset = (
+            held(self.offset.0, was.width, viewport.width),
+            held(self.offset.1, was.height, viewport.height),
+        );
         // An axis the diagram fits on has one sensible position and no other,
         // so a window that grew re-centres rather than leaving the picture
         // hanging off to one side.
@@ -256,6 +270,22 @@ mod tests {
             now.1.abs_diff(point.1 / 2) <= 1,
             "the cell under the pointer moved: {now:?} against {point:?} halved"
         );
+    }
+
+    /// A pane opening beside the diagram takes the right half of the screen.
+    /// The reader was looking at the middle of the view, not its corner, so
+    /// the middle is what stays put -- and comes back when the pane closes.
+    #[test]
+    fn a_narrower_viewport_keeps_the_middle_of_the_view_in_its_middle() {
+        let mut c = cam((200, 400));
+        c.scroll(60, 100);
+        let middle = c.at(40, 12).expect("the middle of the view is on the diagram");
+
+        c.resize(Rect::new(0, 0, 40, 24));
+        assert_eq!(c.at(20, 12), Some(middle), "the pane cut off the right half of the view");
+
+        c.resize(Rect::new(0, 0, 80, 24));
+        assert_eq!(c.at(40, 12), Some(middle), "closing the pane did not give the view back");
     }
 
     #[test]
