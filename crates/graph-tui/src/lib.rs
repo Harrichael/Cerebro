@@ -6,6 +6,7 @@ pub mod controls;
 pub mod editor;
 pub mod label;
 pub mod layout;
+pub mod rank;
 pub mod render;
 pub mod route;
 pub mod scene;

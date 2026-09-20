@@ -40,6 +40,7 @@ use entity_graph::{EntityId, EntityKind};
 use ratatui::layout::Rect;
 
 use crate::label::Labels;
+use crate::rank::Rank;
 use crate::scene::{DrawnEdge, Scene};
 use crate::zoom::{Metrics, Zoom};
 
@@ -61,6 +62,9 @@ const PUSH_ROUNDS: usize = 64;
 /// is only what stops two frames touching. A rank that wraps packs its rows
 /// one apart, and a user may drop a node wherever it fits.
 const CLEARANCE: (i32, i32) = (2, 2);
+/// Edges across one gap that it already has room for. A gap fits a line or
+/// two as it stands; past that each wants a cell of its own to run in.
+const FREE_TRACKS: usize = 2;
 /// Rows of one rank that wrapped are this far apart.
 const WRAP_GAP: u16 = 2;
 /// Width over height a box is happiest at, in cells. A cell is about twice
@@ -169,6 +173,13 @@ pub struct Layout {
     /// be drawn away from its corner while a child is dragged before the
     /// origin; a commit then makes the frame's corner the position again.
     pos: BTreeMap<EntityId, (f32, f32)>,
+    /// Where each node stands among its siblings, as an order rather than a
+    /// distance. The material positions above are what is drawn and what a
+    /// drag edits; this is what says where a node belongs when something has
+    /// to put it back -- and it is remembered, not read back off the picture,
+    /// because the picture cannot always be read back (a level packed across
+    /// centres its columns, so a rank is not a row).
+    rank: BTreeMap<EntityId, Rank>,
 }
 
 impl Layout {
@@ -188,6 +199,23 @@ impl Layout {
     /// Forget every position: the next `settle` ranks the whole picture afresh.
     pub fn clear(&mut self) {
         self.pos.clear();
+        self.rank.clear();
+    }
+
+    pub fn rank_of(&self, id: EntityId) -> Option<&Rank> {
+        self.rank.get(&id)
+    }
+
+    /// Remember where a node now stands among `siblings`, which are given in
+    /// the order they are drawn. Called when a drop has moved it: the picture
+    /// is what changed, and this is the picture read back for the one node
+    /// that moved, which is the one case reading back is unambiguous.
+    pub fn reranked(&mut self, id: EntityId, siblings: &[EntityId]) {
+        let at = siblings.iter().position(|&s| s == id);
+        let Some(at) = at else { return };
+        let before = at.checked_sub(1).and_then(|i| self.rank.get(&siblings[i])).cloned();
+        let after = siblings.get(at + 1).and_then(|s| self.rank.get(s)).cloned();
+        self.rank.insert(id, Rank::between(before.as_ref(), after.as_ref()));
     }
 
     /// Carry positions across a rebuild that renumbered every entity.
@@ -195,6 +223,10 @@ impl Layout {
         self.pos = std::mem::take(&mut self.pos)
             .into_iter()
             .filter_map(|(id, p)| Some((map.get(id.0).copied().flatten()?, p)))
+            .collect();
+        self.rank = std::mem::take(&mut self.rank)
+            .into_iter()
+            .filter_map(|(id, r)| Some((map.get(id.0).copied().flatten()?, r)))
             .collect();
     }
 
@@ -242,42 +274,76 @@ impl Layout {
                     out
                 };
                 // Ranking places frames; what is kept is each frame's origin.
+                let sizes: Vec<(u16, u16)> =
+                    kid_frames.iter().map(|f| (f.size.0 as u16, f.size.1 as u16)).collect();
+                let idx: HashMap<EntityId, usize> =
+                    kids.iter().enumerate().map(|(i, &k)| (k, i)).collect();
+                let edges: Vec<(usize, usize)> = scene
+                    .edges_at(level)
+                    .filter_map(|e| Some((*idx.get(&e.from)?, *idx.get(&e.to)?)))
+                    .collect();
+                let kinds: Vec<EntityKind> =
+                    kids.iter().map(|&k| labels.kind(k).unwrap_or(EntityKind::Function)).collect();
+                let (want, _, _) = arrange(&sizes, &kinds, &edges, avail as u16, &m, level.is_none());
                 let mut placed: Vec<(EntityId, (i32, i32))> = Vec::new();
                 if fresh.len() == kids.len() {
-                    let sizes: Vec<(u16, u16)> =
-                        kid_frames.iter().map(|f| (f.size.0 as u16, f.size.1 as u16)).collect();
-                    let idx: HashMap<EntityId, usize> =
-                        kids.iter().enumerate().map(|(i, &k)| (k, i)).collect();
-                    let edges: Vec<(usize, usize)> = scene
-                        .edges_at(level)
-                        .filter_map(|e| Some((*idx.get(&e.from)?, *idx.get(&e.to)?)))
-                        .collect();
-                    let kinds: Vec<EntityKind> =
-                        kids.iter().map(|&k| labels.kind(k).unwrap_or(EntityKind::Function)).collect();
-                    let (pos, _, _) = arrange(&sizes, &kinds, &edges, avail as u16, &m, level.is_none());
                     for (i, &k) in kids.iter().enumerate() {
-                        placed.push((k, (i32::from(pos[i].0), i32::from(pos[i].1))));
+                        placed.push((k, (i32::from(want[i].0), i32::from(want[i].1))));
                     }
                 } else {
-                    let below = kids
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, k)| {
-                            let p = self.pos.get(k)?;
-                            Some(p.1.round() as i32 + kid_frames[i].off.1 + kid_frames[i].size.1)
+                    // A level already arranged, with something new turning up
+                    // in it: a file added and saved. `want` is where the
+                    // ranking would have put it, which says who it belongs
+                    // between; the ranks those neighbours already carry say
+                    // how to put it there without renumbering either of them.
+                    // Dropping it in a row under everything -- which is what
+                    // this did -- put a new file at the foot of its folder
+                    // however obviously it belonged higher up.
+                    let mut order: Vec<usize> = (0..kids.len()).collect();
+                    order.sort_by_key(|&i| (want[i].1, want[i].0, i));
+                    let mut origin: Vec<Option<(i32, i32)>> = (0..kids.len())
+                        .map(|i| {
+                            let p = self.pos.get(&kids[i])?;
+                            Some((
+                                p.0.round() as i32 + kid_frames[i].off.0,
+                                p.1.round() as i32 + kid_frames[i].off.1,
+                            ))
                         })
-                        .max()
-                        .unwrap_or(0)
-                        + i32::from(m.gap_y);
-                    let mut x = 0i32;
-                    for i in fresh {
-                        let (w, _) = kid_frames[i].size;
-                        if x > 0 && x + w > avail {
-                            x = 0;
+                        .collect();
+                    for at in 0..order.len() {
+                        let i = order[at];
+                        if origin[i].is_some() {
+                            continue;
                         }
-                        placed.push((kids[i], (x, below)));
-                        x += w + i32::from(m.gap_x);
+                        let rank = Rank::between(
+                            order[..at].iter().rev().find_map(|&x| self.rank.get(&kids[x])),
+                            order[at + 1..].iter().find_map(|&x| self.rank.get(&kids[x])),
+                        );
+                        self.rank.insert(kids[i], rank);
+                        // Beside the nearest neighbour that has a place, on
+                        // the side its order puts it. Landing on top of one
+                        // would do as well -- the push reads the order now --
+                        // but starting clear of it keeps the shove small.
+                        let w = kid_frames[i].size.0;
+                        let before = order[..at].iter().rev().find_map(|&x| Some((x, origin[x]?)));
+                        let after = order[at + 1..].iter().find_map(|&x| Some((x, origin[x]?)));
+                        let spot = match (before, after) {
+                            (Some((x, at)), _) => {
+                                (at.0 + kid_frames[x].size.0 + i32::from(m.gap_x), at.1)
+                            }
+                            (None, Some((_, at))) => (at.0 - w - i32::from(m.gap_x), at.1),
+                            (None, None) => (0, 0),
+                        };
+                        origin[i] = Some(spot);
+                        placed.push((kids[i], spot));
                     }
+                }
+                // Ranked in the order they were placed, reading order, so a
+                // level's first ordering agrees with how it is drawn.
+                let mut fresh_order: Vec<(EntityId, (i32, i32))> = placed.clone();
+                fresh_order.sort_by_key(|(_, at)| (at.1, at.0));
+                for (n, (k, _)) in fresh_order.into_iter().enumerate() {
+                    self.rank.entry(k).or_insert_with(|| Rank::nth(n));
                 }
                 for (i, (k, at)) in placed.into_iter().enumerate() {
                     let off = kid_frames[kids.iter().position(|&x| x == k).unwrap_or(i)].off;
@@ -379,7 +445,13 @@ struct Geo {
 /// beside a box that has just grown taller than it is still *beside* it,
 /// and goes right rather than up out of its row. Both move half the way
 /// unless one is anchored, in which case the other moves all of it.
-fn separate(geos: &mut [Geo], anchored: &[bool], gap: (i32, i32)) {
+///
+/// Two nodes at the same place are the case geometry cannot answer: there is
+/// no "differ on more" between two zeroes. `first` breaks it -- the position
+/// each node holds in its level's remembered order -- because the fallback
+/// was the order the graph happened to list them in, which is nothing the
+/// reader chose and nothing they can change.
+fn separate(geos: &mut [Geo], anchored: &[bool], first: &[usize], gap: (i32, i32)) {
     let mut order: Vec<usize> = (0..geos.len()).collect();
     for _ in 0..PUSH_ROUNDS {
         let mut moved = false;
@@ -409,6 +481,15 @@ fn separate(geos: &mut [Geo], anchored: &[bool], gap: (i32, i32)) {
                     (true, oy, if dy >= 0.0 { 1 } else { -1 })
                 } else {
                     (false, ox, if dx >= 0.0 { 1 } else { -1 })
+                };
+                // `sign` of 1 sends `i` back and `j` on; exactly on top of
+                // one another, which of them goes which way is the order's
+                // to say.
+                let flat = if along_y { b.y == a.y } else { b.x == a.x };
+                let sign = match flat {
+                    true if first[i] > first[j] => -1,
+                    true => 1,
+                    false => sign,
                 };
                 let (ma, mb) = match (anchored[i], anchored[j]) {
                     (true, _) => (0, overlap),
@@ -493,6 +574,21 @@ impl<'a> Fitter<'a> {
         }
     }
 
+    /// Each node's place in the level's remembered order, as an index. Nodes
+    /// with no rank yet -- new this frame -- keep the order they are listed
+    /// in, which is the best that can be said about them.
+    fn order_of(&self, kids: &[EntityId]) -> Vec<usize> {
+        let mut by_rank: Vec<usize> = (0..kids.len()).collect();
+        by_rank.sort_by(|&a, &b| {
+            self.layout.rank_of(kids[a]).cmp(&self.layout.rank_of(kids[b])).then(a.cmp(&b))
+        });
+        let mut first = vec![0; kids.len()];
+        for (place, &i) in by_rank.iter().enumerate() {
+            first[i] = place;
+        }
+        first
+    }
+
     fn frame(&mut self, id: EntityId) -> Frame {
         if self.scene.is_box(id) {
             if let Some(&f) = self.frames.get(&id) {
@@ -520,7 +616,7 @@ impl<'a> Fitter<'a> {
         }
         if !self.loose.contains(&level) {
             let anchored: Vec<bool> = kids.iter().map(|k| self.anchored.contains(k)).collect();
-            separate(&mut geos, &anchored, CLEARANCE);
+            separate(&mut geos, &anchored, &self.order_of(&kids), CLEARANCE);
         }
         let min_x = geos.iter().map(|g| g.x).min().unwrap_or(0);
         let min_y = geos.iter().map(|g| g.y).min().unwrap_or(0);
@@ -676,11 +772,11 @@ fn pack(
     downward_only: bool,
 ) -> (Vec<(u16, u16)>, u16, u16) {
     let ranks = layers(sizes.len(), edges);
-    let down = pack_down(sizes, &ranks, max_w, m);
+    let down = pack_down(sizes, &ranks, edges, max_w, m);
     if downward_only || ranks.len() < 2 {
         return down;
     }
-    let across = pack_across(sizes, &ranks, m);
+    let across = pack_across(sizes, &ranks, edges, m);
     let score = |w: u16, h: u16| ((f32::from(w.max(1)) / f32::from(h.max(1))).ln() - TARGET_ASPECT.ln()).abs();
     if score(across.1, across.2) < score(down.1, down.2) && across.1 <= max_w {
         across
@@ -737,7 +833,7 @@ fn arrange(
             return (Vec::new(), 0, 0);
         }
         let (sizes, edges) = local(group);
-        pack_down(&sizes, &layers(sizes.len(), &edges), width, m)
+        pack_down(&sizes, &layers(sizes.len(), &edges), &edges, width, m)
     };
     let (mut left, mut right) = (column(&functions, max_w), column(&types, max_w));
     // Side by side when there is room; each in half the room when not.
@@ -776,6 +872,47 @@ fn arrange(
     (pos, width, below + left.2.max(right.2))
 }
 
+/// How many edges cross each gap between consecutive ranks.
+///
+/// An edge between two ranks passes through every gap between them, and is
+/// counted in each. Counted over the edges as given rather than the ones
+/// layering kept: an edge it ranked backwards is still drawn, and is the
+/// hardest of the lot to find a way for.
+fn crossings(n: usize, ranks: &[Vec<usize>], edges: &[(usize, usize)]) -> Vec<usize> {
+    let mut rank_of = vec![usize::MAX; n];
+    for (r, rank) in ranks.iter().enumerate() {
+        for &v in rank {
+            if let Some(slot) = rank_of.get_mut(v) {
+                *slot = r;
+            }
+        }
+    }
+    let mut over = vec![0usize; ranks.len().saturating_sub(1)];
+    for &(a, b) in edges {
+        let (ra, rb) = (rank_of.get(a).copied(), rank_of.get(b).copied());
+        let (Some(ra), Some(rb)) = (ra, rb) else { continue };
+        if ra == usize::MAX || rb == usize::MAX {
+            continue;
+        }
+        for crossed in over.iter_mut().take(ra.max(rb)).skip(ra.min(rb)) {
+            *crossed += 1;
+        }
+    }
+    over
+}
+
+/// What a gap between ranks opens out to for the lines crossing it.
+///
+/// A gap is where every edge between two ranks has to run, and they all take
+/// the same taut line through it, so a crowded one had every line in the
+/// picture stacked on the same few cells. It widens by a cell a line, and by
+/// at most its own width again -- a level with fifty edges across one gap
+/// cannot be given fifty rows, and past that the lines share as they did.
+fn gap_for(crossing: usize, m: &Metrics) -> u16 {
+    let extra = crossing.saturating_sub(FREE_TRACKS).min(usize::from(m.gap_y));
+    m.gap_y.saturating_add(extra as u16)
+}
+
 /// Ranks as rows. A rank wraps when it would exceed `max_w`: layering puts
 /// every edge between different ranks, so nodes inside one rank never link
 /// to each other and wrapping one cannot cross an edge. Every row is then
@@ -783,13 +920,15 @@ fn arrange(
 fn pack_down(
     sizes: &[(u16, u16)],
     ranks: &[Vec<usize>],
+    edges: &[(usize, usize)],
     max_w: u16,
     m: &Metrics,
 ) -> (Vec<(u16, u16)>, u16, u16) {
+    let over = crossings(sizes.len(), ranks, edges);
     let mut pos = vec![(0u16, 0u16); sizes.len()];
     let mut rows: Vec<(Vec<usize>, u16)> = Vec::new();
     let (mut y, mut widest) = (0u16, 0u16);
-    for rank in ranks {
+    for (r, rank) in ranks.iter().enumerate() {
         let (mut x, mut tallest) = (0u16, 0u16);
         let mut row: Vec<usize> = Vec::new();
         for &v in rank {
@@ -808,7 +947,7 @@ fn pack_down(
             widest = widest.max(x.saturating_sub(m.gap_x));
         }
         rows.push((row, x.saturating_sub(m.gap_x)));
-        y = y.saturating_add(tallest).saturating_add(m.gap_y);
+        y = y.saturating_add(tallest).saturating_add(gap_for(over.get(r).copied().unwrap_or(0), m));
     }
     for (row, width) in rows {
         let shift = (widest - width) / 2;
@@ -816,15 +955,23 @@ fn pack_down(
             pos[v].0 += shift;
         }
     }
+    // The last rank added a gap it has nothing to be apart from, and with
+    // nothing after it that gap was never widened.
     (pos, widest, y.saturating_sub(m.gap_y))
 }
 
 /// Ranks as columns, each column centred on the tallest.
-fn pack_across(sizes: &[(u16, u16)], ranks: &[Vec<usize>], m: &Metrics) -> (Vec<(u16, u16)>, u16, u16) {
+fn pack_across(
+    sizes: &[(u16, u16)],
+    ranks: &[Vec<usize>],
+    edges: &[(usize, usize)],
+    m: &Metrics,
+) -> (Vec<(u16, u16)>, u16, u16) {
+    let over = crossings(sizes.len(), ranks, edges);
     let mut pos = vec![(0u16, 0u16); sizes.len()];
     let mut columns: Vec<(Vec<usize>, u16)> = Vec::new();
     let (mut x, mut tallest) = (0u16, 0u16);
-    for rank in ranks {
+    for (r, rank) in ranks.iter().enumerate() {
         let (mut y, mut widest) = (0u16, 0u16);
         for &v in rank {
             let (w, h) = sizes[v];
@@ -837,7 +984,7 @@ fn pack_across(sizes: &[(u16, u16)], ranks: &[Vec<usize>], m: &Metrics) -> (Vec<
         tallest = tallest.max(height);
         // The between-rank gap is the same distance whichever way ranks
         // run: it is where the edges bend, and a bend needs the same room.
-        x = x.saturating_add(widest).saturating_add(m.gap_y);
+        x = x.saturating_add(widest).saturating_add(gap_for(over.get(r).copied().unwrap_or(0), m));
     }
     for (column, height) in columns {
         let shift = (tallest - height) / 2;
@@ -1225,7 +1372,7 @@ mod tests {
             Geo { x: 0, y: 0, w: 10, h: 4 },
             Geo { x: 4, y: 1, w: 10, h: 4 },
         ];
-        separate(&mut geos, &[false, false], gap);
+        separate(&mut geos, &[false, false], &[0, 1], gap);
         assert!(geos[0].x + geos[0].w + gap.0 <= geos[1].x, "still overlapping: {geos:?}");
         assert!(geos[0].x < geos[1].x, "order flipped");
         assert_eq!(geos[0].y, 0, "a sideways overlap was pushed vertically");
@@ -1235,7 +1382,7 @@ mod tests {
             Geo { x: 0, y: 0, w: 10, h: 4 },
             Geo { x: 4, y: 1, w: 10, h: 4 },
         ];
-        separate(&mut anchored, &[true, false], gap);
+        separate(&mut anchored, &[true, false], &[0, 1], gap);
         assert_eq!(anchored[0], Geo { x: 0, y: 0, w: 10, h: 4 }, "the anchored node moved");
         assert_eq!(anchored[1].x, 12, "the other should move the whole overlap plus gap");
 
@@ -1244,7 +1391,7 @@ mod tests {
             Geo { x: 0, y: 0, w: 10, h: 4 },
             Geo { x: 1, y: 3, w: 10, h: 4 },
         ];
-        separate(&mut stacked, &[false, false], gap);
+        separate(&mut stacked, &[false, false], &[0, 1], gap);
         assert_eq!((stacked[0].x, stacked[1].x), (0, 1), "a vertical overlap moved sideways");
         assert!(stacked[0].y + stacked[0].h + gap.1 <= stacked[1].y);
 
@@ -1255,8 +1402,110 @@ mod tests {
             Geo { x: 0, y: 0, w: 60, h: 20 },
             Geo { x: 50, y: 1, w: 12, h: 3 },
         ];
-        separate(&mut grown, &[true, false], gap);
+        separate(&mut grown, &[true, false], &[0, 1], gap);
         assert_eq!(grown[1], Geo { x: 62, y: 1, w: 12, h: 3 }, "pushed out of its row: {grown:?}");
+    }
+
+    /// The gap between two ranks is where every edge between them has to
+    /// run, and they all take much the same taut line through it -- so a
+    /// crowded gap had the whole picture's lines stacked on a few cells. It
+    /// now opens out for its traffic, and only for its traffic: the same
+    /// nodes with one edge between them stay as close as they ever were.
+    #[test]
+    fn a_gap_opens_out_for_the_edges_that_have_to_cross_it() {
+        let m = Zoom::Close.metrics();
+        let sizes = vec![(10u16, 4u16); 6];
+        let ranks = vec![vec![0, 1, 2], vec![3, 4, 5]];
+        let depth = |edges: &[(usize, usize)]| pack_down(&sizes, &ranks, edges, 200, &m).2;
+
+        let quiet = depth(&[(0, 3)]);
+        let busy = depth(&[(0, 3), (0, 4), (0, 5), (1, 3), (1, 4), (1, 5), (2, 3)]);
+        assert!(busy > quiet, "a crowded gap got no more room than an empty one: {busy} vs {quiet}");
+
+        // A gap opens by at most its own width again, however heavy it gets.
+        let swamped: Vec<(usize, usize)> =
+            (0..3).flat_map(|a| (3..6).map(move |b| (a, b))).cycle().take(200).collect();
+        assert!(depth(&swamped) <= quiet + m.gap_y, "one gap swallowed the level");
+
+        // Edges inside a rank cross no gap and ask for nothing.
+        assert_eq!(depth(&[(0, 1), (1, 2), (3, 4)]), depth(&[]), "a same-rank edge widened a gap");
+    }
+
+    /// A file added to a folder that is already arranged. It used to be laid
+    /// in a row under everything, so a new file sat at the foot of its folder
+    /// however obviously it belonged higher up. Now the ranking says who it
+    /// belongs between and the ranks those two already carry say how to put
+    /// it there -- so it arrives among its siblings, and neither of them is
+    /// renumbered to make room.
+    #[test]
+    fn a_file_that_turns_up_later_is_inserted_among_its_siblings() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+            ("c.rs", File, Some(0)),
+        ];
+        // b.rs calls c.rs, so the ranking has an opinion about the order.
+        let graph = graph_from_parents(&rows, &[(2, 3, Call)]);
+        let labels = Labels::new(&graph);
+        let (a, b, c) = (EntityId(1), EntityId(2), EntityId(3));
+
+        // Settle with only two of them in the picture, as though c.rs had
+        // not been written yet.
+        let mut without = fully_expanded(&graph);
+        without.nodes.retain(|&n| n != c);
+        without.edges.retain(|e| e.from != c && e.to != c);
+        let mut layout = Layout::new();
+        let first = Scene::new(&graph, &without);
+        layout.settle(&first, &labels, 120);
+        let (was_a, was_b) = (layout.rank_of(a).cloned(), layout.rank_of(b).cloned());
+        assert!(was_a.is_some() && was_b.is_some(), "the first two should be ranked");
+        assert_eq!(layout.rank_of(c), None, "c.rs is not in the picture yet");
+
+        // c.rs appears. Only it is fresh.
+        let whole = Scene::new(&graph, &fully_expanded(&graph));
+        layout.settle(&whole, &labels, 120);
+        assert_eq!(layout.rank_of(a).cloned(), was_a, "a.rs was renumbered to make room");
+        assert_eq!(layout.rank_of(b).cloned(), was_b, "b.rs was renumbered to make room");
+        assert!(layout.rank_of(c).is_some(), "c.rs was not ranked when it arrived");
+
+        // It is drawn among them rather than in a row beneath the lot, and
+        // the order remembered is the order drawn.
+        let drawn = layout.materialize(&whole, &labels, Zoom::Close, &Options::default());
+        let rect = |id| drawn.rect_of(id).expect("all three are drawn");
+        let (ra, rb, rc) = (rect(a), rect(b), rect(c));
+        assert!(rc.y < ra.bottom().max(rb.bottom()), "c.rs landed under everything: {rc:?}");
+
+        let mut by_rank = [a, b, c];
+        by_rank.sort_by_key(|&id| layout.rank_of(id).cloned());
+        let mut by_place = [a, b, c];
+        by_place.sort_by_key(|&id| (rect(id).y, rect(id).x));
+        assert_eq!(by_rank, by_place, "the order remembered is not the order drawn");
+    }
+
+    /// Two nodes at the same place: there is no "differ on more" between two
+    /// zeroes, so nothing about where they are says which should go first.
+    /// The order the level remembers says it, and says the opposite when it
+    /// is the opposite -- the fallback was the order the graph listed them
+    /// in, which the reader neither chose nor can change.
+    #[test]
+    fn nodes_on_the_same_spot_come_apart_in_the_order_the_level_remembers() {
+        let gap = (2, 2);
+        let stacked = || vec![Geo { x: 8, y: 0, w: 10, h: 4 }, Geo { x: 8, y: 0, w: 10, h: 4 }];
+
+        let mut in_order = stacked();
+        separate(&mut in_order, &[false, false], &[0, 1], gap);
+        assert!(in_order[0].x < in_order[1].x, "the first by order did not go first: {in_order:?}");
+
+        let mut reversed = stacked();
+        separate(&mut reversed, &[false, false], &[1, 0], gap);
+        assert!(reversed[0].x > reversed[1].x, "the order was not what decided: {reversed:?}");
+
+        // Whichever way round, they end up clear of each other by the gap.
+        for pair in [in_order, reversed] {
+            let (l, r) = if pair[0].x < pair[1].x { (pair[0], pair[1]) } else { (pair[1], pair[0]) };
+            assert!(l.x + l.w + gap.0 <= r.x, "still overlapping: {pair:?}");
+        }
     }
 
     /// A drag: the node moves by what the pointer moved, at the zoom being

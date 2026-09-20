@@ -726,6 +726,34 @@ impl App {
         }
     }
 
+    /// Read the order back off the picture for nodes that have just been put
+    /// somewhere, and remember it.
+    ///
+    /// Only these nodes are re-read. The picture as a whole is not a thing
+    /// the order can be recovered from -- a level packed across centres its
+    /// columns, so its ranks are not its rows -- but *one* node's place among
+    /// siblings that are already in order is unambiguous, and that is all a
+    /// drop needs to say.
+    fn remember_order(&mut self, moved: &[EntityId]) {
+        let mut levels: std::collections::BTreeSet<Option<EntityId>> = Default::default();
+        for id in moved {
+            levels.insert(self.scene.parent.get(id).copied());
+        }
+        for level in levels {
+            let mut siblings: Vec<(EntityId, Rect)> = self
+                .scene
+                .children(level)
+                .iter()
+                .filter_map(|&id| Some((id, self.diagram.rect_of(id)?)))
+                .collect();
+            siblings.sort_by_key(|(_, r)| (r.y, r.x));
+            let order: Vec<EntityId> = siblings.into_iter().map(|(id, _)| id).collect();
+            for id in moved.iter().filter(|id| order.contains(id)) {
+                self.layout.reranked(*id, &order);
+            }
+        }
+    }
+
     /// Move the focused node -- or the group it is in -- a step, the way a
     /// drag would: it lands there, its siblings make way, and it holds its
     /// place on screen while the canvas re-normalises underneath.
@@ -736,9 +764,10 @@ impl App {
             if self.group.contains(&sel) { self.group.iter().copied().collect() } else { vec![sel] };
         let screen = self.camera.screen_of((rect.x, rect.y));
         self.layout.nudge(&ids, by, self.zoom);
-        let opts = Options { anchored: ids.into_iter().collect(), loose: Default::default() };
+        let opts = Options { anchored: ids.iter().copied().collect(), loose: Default::default() };
         let anchor = Anchor::Node { id: sel, corner: (0, 0), screen: (screen.0 + by.0, screen.1 + by.1) };
         self.rebuild_with(anchor, &opts);
+        self.remember_order(&ids);
     }
 
     /// What each switch currently reads. Kept next to the code that acts on
@@ -1073,9 +1102,13 @@ impl App {
             // The siblings make way now, and where everything lands is the
             // arrangement from here on.
             Drag::Moving { moved, held, .. } => {
-                let opts = Options { anchored: moved.into_iter().collect(), loose: Default::default() };
+                let opts =
+                    Options { anchored: moved.iter().copied().collect(), loose: Default::default() };
                 let anchor = Anchor::Node { id: held.0, corner: held.1, screen: (i32::from(at.0), i32::from(at.1)) };
                 self.rebuild_with(anchor, &opts);
+                // The picture is what the drop changed; the order is then
+                // read back off it, for the nodes that moved and no others.
+                self.remember_order(&moved);
             }
             Drag::Marquee { from, .. } => {
                 let (a, b) = (self.camera.unclamped_at(from.0, from.1), self.camera.unclamped_at(at.0, at.1));
@@ -2131,6 +2164,46 @@ mod tests {
         press_at(&mut app, at.0, at.1);
         release_at(&mut app, at.0, at.1);
         assert!(app.group.is_empty(), "clicking outside the group should let it go");
+    }
+
+    fn rank_of(app: &App, id: EntityId) -> graph_tui::rank::Rank {
+        app.layout.rank_of(id).cloned().expect("every drawn node is ranked")
+    }
+
+    /// A drop changes the picture, and the order is read back off it
+    /// afterwards -- for the node that moved, and nobody else. Dragging the
+    /// last of a row in among the first two must leave it ordered between
+    /// them while their own ranks are untouched, which is the whole reason a
+    /// rank is a list of parts rather than a number: there is always room
+    /// between two of them, so an insertion never renumbers a neighbour.
+    #[test]
+    fn a_drop_is_remembered_as_an_order_between_its_new_neighbours() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("a.rs", File, Some(0)),
+            ("b.rs", File, Some(0)),
+            ("c.rs", File, Some(0)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 100, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        let (a, b, c) = (EntityId(1), EntityId(2), EntityId(3));
+        let (was_a, was_b, was_c) = (rank_of(&app, a), rank_of(&app, b), rank_of(&app, c));
+        assert!(was_a < was_b && was_b < was_c, "the row should start in reading order");
+
+        let ar = app.diagram.rect_of(a).expect("a is drawn");
+        let cr = app.diagram.rect_of(c).expect("c is drawn");
+        let grab = screen(&app, cr.x + 1, cr.y + 1);
+        let onto = screen(&app, ar.right() + 1, ar.y + 1);
+        press_at(&mut app, grab.0, grab.1);
+        drag_to(&mut app, onto.0, onto.1);
+        release_at(&mut app, onto.0, onto.1);
+
+        let now = |id| rank_of(&app, id);
+        assert!(now(a) < now(c), "c did not come to rest after a");
+        assert!(now(c) < now(b), "c did not come to rest before b");
+        assert_eq!(now(a), was_a, "a was renumbered by an insertion beside it");
+        assert_eq!(now(b), was_b, "b was renumbered by an insertion beside it");
+        assert_ne!(now(c), was_c, "c moved but its order was not remembered");
     }
 
     /// A box draws itself all the way round -- title rows, sides and bottom
