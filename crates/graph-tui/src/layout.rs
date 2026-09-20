@@ -78,6 +78,22 @@ pub struct Placed {
     pub depth: u8,
 }
 
+impl Placed {
+    /// Is this cell part of the room a box keeps for its children, rather
+    /// than the frame it draws around them? The renderer fills the frame with
+    /// the box's own ink and leaves this to whatever is inside, so the two
+    /// have to agree: a cell drawn as the box's that the hit-test does not
+    /// count as the box's is a cell the user can click and nothing happens.
+    pub fn holds(&self, point: (u16, u16)) -> bool {
+        let r = self.rect;
+        self.is_box
+            && point.0 > r.x
+            && point.0 + 1 < r.right()
+            && point.1 >= r.y + INSET.1 as u16
+            && point.1 + 1 < r.bottom()
+    }
+}
+
 pub struct Diagram {
     pub nodes: Vec<Placed>,
     pub edges: Vec<DrawnEdge>,
@@ -107,13 +123,15 @@ impl Diagram {
             .map(|n| n.id)
     }
 
-    /// The box whose title rows are under a cell: the part of a box that is
-    /// only ever the box's, which is what makes it the handle to drag it by.
+    /// The box whose frame is under a cell -- its title rows, its sides and
+    /// its bottom. That frame is the whole of what a box draws for itself
+    /// rather than keeps for its children, which makes it both the handle to
+    /// drag the box by and the place to click to select it. The deepest wins,
+    /// since a nested box's frame stands in its parent's room.
     pub fn handle_at(&self, point: (u16, u16)) -> Option<EntityId> {
         self.nodes
             .iter()
-            .filter(|n| n.is_box && n.rect.contains(point.into()))
-            .filter(|n| point.1 < n.rect.y + INSET.1 as u16)
+            .filter(|n| n.is_box && n.rect.contains(point.into()) && !n.holds(point))
             .max_by_key(|n| n.depth)
             .map(|n| n.id)
     }

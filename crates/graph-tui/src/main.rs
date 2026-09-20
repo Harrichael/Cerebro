@@ -25,6 +25,7 @@ use graph_tui::label::Labels;
 use graph_tui::layout::{Diagram, Layout, Options};
 use graph_tui::render::{self, Lit, Rendered};
 use graph_tui::scene::Scene;
+use graph_tui::trail::{Tier, Trail};
 use graph_tui::view::{self, Settings};
 use graph_tui::zoom::Zoom;
 
@@ -45,7 +46,7 @@ const WHEEL_X: i32 = 6;
 /// switches, which say their own keys in the corner of the screen.
 const KEYS: &[(&str, &str)] = &[
     ("↑ ↓ ← →", "move the focus to the nearest node that way, among its siblings"),
-    ("tab  ⇧tab", "focus into a box, or out to the box around"),
+    ("tab  ⇧tab", "focus into a box -- opening it if it is shut -- or out to the box around"),
     ("⌥↑ ↓ ← →  /  ctrl-↑ ↓ ← →", "move the focused node -- or its group -- a step"),
     ("⇧↑ ↓ ← →  /  k j h l", "scroll"),
     ("PgUp PgDn  /  space", "scroll a half screen"),
@@ -53,7 +54,7 @@ const KEYS: &[(&str, &str)] = &[
     ("n p", "focus the next or previous node, reading order"),
     ("click", "select a node, or press a button on its frame"),
     ("⇧click", "add a node to the group, or take it out"),
-    ("drag", "move a node -- or the group it is in; drag a box by its title"),
+    ("drag", "move a node -- or the group it is in; drag a box by its frame"),
     ("drag on nothing", "sweep out a group"),
     ("L", "lay the whole picture out afresh"),
     ("scroll  ⇧scroll", "pan up and down, or left and right"),
@@ -128,6 +129,9 @@ struct App {
     /// primary selection is not necessarily among them.
     group: std::collections::BTreeSet<EntityId>,
     drag: Drag,
+    /// Where the focus has been, so a key that undoes a step goes back the
+    /// way it came rather than wherever the geometry now points.
+    trail: Trail,
     /// Edges are laid out either way; this only decides whether they are
     /// drawn. Turning them off to read the names should not move the names.
     show_edges: bool,
@@ -246,6 +250,7 @@ impl App {
             selected: None,
             group: Default::default(),
             drag: Drag::Idle,
+            trail: Trail::default(),
             show_edges: true,
             panel: controls::Panel::default(),
             help: false,
@@ -288,6 +293,7 @@ impl App {
         self.selected = self.selected.and_then(moved);
         self.group = self.group.iter().copied().filter_map(moved).collect();
         self.layout.migrate(&map);
+        self.trail.migrate(&map);
         self.settings.hidden = self.settings.hidden.iter().copied().filter_map(moved).collect();
         self.settings.scope = self.settings.scope.and_then(moved);
         // The pane is showing a file, not an id, so it needs nothing said to
@@ -625,6 +631,12 @@ impl App {
     /// of the same box, so the arrows never leave the level; tab does that.
     /// Nothing squarely that way falls back to anything at all that way,
     /// so a wrapped row's next row is still "down" from its end.
+    ///
+    /// Where two are equally good answers, the one the focus last arrived
+    /// from wins, so walking back retraces walking out. That is only ever a
+    /// tie-break within one of the two passes: a remembered neighbour the
+    /// layout has since moved is no longer among what that pass offers, and
+    /// distance decides again.
     fn move_focus(&mut self, dir: (i32, i32)) {
         let Some(sel) = self.selected else {
             self.focus_in();
@@ -634,7 +646,10 @@ impl App {
         let centre = |r: Rect| (f32::from(r.x) + f32::from(r.width) / 2.0, f32::from(r.y) + f32::from(r.height) / 2.0);
         let (fx, fy) = centre(from);
         let level = self.scene.parent.get(&sel).copied();
-        let best = self
+        // Collected in the order the level lists its children and never
+        // sorted, so that candidates the cost cannot separate are still
+        // settled by `min_by` taking the first of them.
+        let ways: Vec<(EntityId, Tier, f32)> = self
             .scene
             .children(level)
             .iter()
@@ -644,37 +659,69 @@ impl App {
                 let (dx, dy) = ((x - fx) / 2.0, y - fy);
                 let ahead = dx * dir.0 as f32 + dy * dir.1 as f32;
                 let aside = (dx * dir.1 as f32 - dy * dir.0 as f32).abs();
-                (ahead > 0.0).then_some((id, (aside > ahead, ahead + 2.0 * aside)))
+                let tier = match aside > ahead {
+                    true => Tier::Far,
+                    false => Tier::Near,
+                };
+                (ahead > 0.0).then_some((id, tier, ahead + 2.0 * aside))
             })
-            .min_by(|a, b| a.1.0.cmp(&b.1.0).then(a.1.1.total_cmp(&b.1.1)));
-        if let Some((id, _)) = best {
+            .collect();
+
+        for tier in [Tier::Near, Tier::Far] {
+            let here = || ways.iter().filter(|w| w.1 == tier);
+            let Some(nearest) = here().min_by(|a, b| a.2.total_cmp(&b.2)) else { continue };
+            let id = self
+                .trail
+                .back(sel, dir, tier)
+                .filter(|id| here().any(|w| w.0 == *id))
+                .unwrap_or(nearest.0);
+            self.trail.stepped(sel, dir, tier, id);
             self.select(id);
+            return;
         }
     }
 
-    /// Into the focused box: its first child in reading order. With nothing
-    /// focused, the first root.
+    /// Into the focused box: the child the focus last rose out of, or its
+    /// first in reading order. With nothing focused, the first root.
+    ///
+    /// A leaf that can open is opened on the way in, since asking to go
+    /// inside something is asking for it to be open, and stopping to press
+    /// `↵` first serves nobody. One that cannot open has nowhere to go.
+    ///
+    /// The remembered child is checked against the children the box has now,
+    /// because expanding, hiding and scoping all change those without the
+    /// focus going anywhere near the box.
     fn focus_in(&mut self) {
+        if self.selected.is_some_and(|id| !self.scene.is_box(id)) {
+            self.expand();
+        }
         let level = match self.selected {
             None => None,
             Some(id) if self.scene.is_box(id) => Some(id),
             Some(_) => return,
         };
+        let kids = self.scene.children(level);
         let first = self
-            .scene
-            .children(level)
-            .iter()
-            .filter_map(|&id| Some((id, self.diagram.rect_of(id)?)))
-            .min_by_key(|(_, r)| (r.y, r.x))
-            .map(|(id, _)| id);
+            .trail
+            .inward(level)
+            .filter(|id| kids.contains(id))
+            .or_else(|| {
+                kids.iter()
+                    .filter_map(|&id| Some((id, self.diagram.rect_of(id)?)))
+                    .min_by_key(|(_, r)| (r.y, r.x))
+                    .map(|(id, _)| id)
+            });
         if let Some(id) = first {
             self.select(id);
         }
     }
 
-    /// Out to the box around the focus.
+    /// Out to the box around the focus, which is told where the focus was so
+    /// that tab comes back to it.
     fn focus_out(&mut self) {
-        if let Some(parent) = self.selected.and_then(|id| self.scene.parent.get(&id).copied()) {
+        let Some(sel) = self.selected else { return };
+        if let Some(parent) = self.scene.parent.get(&sel).copied() {
+            self.trail.rose(sel, Some(parent));
             self.select(parent);
         }
     }
@@ -1625,6 +1672,7 @@ where
 mod tests {
     use super::*;
     use entity_graph::EntityKind::{File, Folder, Function};
+    use graph_tui::layout::INSET;
     use entity_graph::ReferenceKind::Call;
     use entity_graph::test_support::graph_from_parents;
 
@@ -2085,6 +2133,52 @@ mod tests {
         assert!(app.group.is_empty(), "clicking outside the group should let it go");
     }
 
+    /// A box draws itself all the way round -- title rows, sides and bottom
+    /// -- and every one of those cells is the box's rather than its
+    /// children's, so a click on any of them takes hold of it. The room it
+    /// keeps for its children is the only part that is not the box, which is
+    /// what leaves a sweep inside a box still able to start.
+    #[test]
+    fn clicking_any_edge_of_a_box_selects_it() {
+        let rows: Vec<(&str, entity_graph::EntityKind, Option<usize>)> = vec![
+            ("root", Folder, None),
+            ("left", Folder, Some(0)),
+            ("right", Folder, Some(0)),
+            ("a.rs", File, Some(1)),
+            ("b.rs", File, Some(2)),
+        ];
+        let mut app = app_with(graph_from_parents(&rows, &[]), Rect::new(0, 0, 100, 40));
+        app.key(KeyCode::Enter, KeyModifiers::NONE);
+        app.select(EntityId(1));
+        app.key(KeyCode::Enter, KeyModifiers::NONE); // left -> a.rs
+        let (left, a) = (EntityId(1), EntityId(3));
+        let r = app.diagram.rect_of(left).expect("the box is drawn");
+
+        for (where_, point) in [
+            ("its bottom", (r.x + 1, r.bottom() - 1)),
+            ("its left side", (r.x, r.y + INSET.1 as u16)),
+            ("its right side", (r.right() - 1, r.y + INSET.1 as u16)),
+            ("its title", (r.x + 1, r.y + 1)),
+        ] {
+            app.select(a);
+            let at = screen(&app, point.0, point.1);
+            press_at(&mut app, at.0, at.1);
+            assert_eq!(app.selected, Some(left), "clicking {where_} did not select the box");
+            assert!(
+                matches!(app.drag, Drag::Pending { grab: Grab::Box(id), .. } if id == left),
+                "clicking {where_} did not take hold of the box"
+            );
+            release_at(&mut app, at.0, at.1);
+        }
+
+        // The room inside is the children's, so a press there still starts a
+        // sweep rather than grabbing the box around it.
+        let gap = screen(&app, r.right() - 2, r.bottom() - 2);
+        press_at(&mut app, gap.0, gap.1);
+        assert!(matches!(app.drag, Drag::Pending { grab: Grab::Nothing, .. }), "the box swallowed a sweep");
+        release_at(&mut app, gap.0, gap.1);
+    }
+
     /// A box is dragged by its title rows and everything in it comes along.
     #[test]
     fn dragging_a_box_by_its_title_moves_what_is_in_it() {
@@ -2180,7 +2274,7 @@ mod tests {
         app.key(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(app.selected, Some(a), "tab did not go to the first child");
         app.key(KeyCode::Tab, KeyModifiers::NONE);
-        assert_eq!(app.selected, Some(a), "a leaf has nothing to go into");
+        assert_eq!(app.selected, Some(a), "a leaf with nothing in it has nowhere to go");
 
         app.key(KeyCode::Right, KeyModifiers::NONE);
         assert_eq!(app.selected, Some(b));
@@ -2197,6 +2291,80 @@ mod tests {
         app.key(KeyCode::Down, KeyModifiers::SHIFT);
         assert_eq!(app.selected, Some(b), "shift-arrow moved the focus");
         assert_ne!(app.camera.offset, offset, "shift-arrow did not scroll");
+    }
+
+    /// Two nodes sit side by side on one row with a third centred below
+    /// them, so going back up is a question distance can barely answer -- and
+    /// answers the same way whichever of the pair the focus came down from.
+    /// The way it came is the better answer, and it survives being re-walked.
+    #[test]
+    fn going_back_up_returns_to_the_node_you_came_down_from() {
+        let mut app = app();
+        let (file_00, file_01, tests_rs) = (EntityId(2), EntityId(3), EntityId(10));
+
+        app.select(file_01);
+        app.key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(file_00), "fixture should make distance alone answer file_00.rs");
+
+        app.select(tests_rs);
+        app.key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(file_01), "down from either of the pair lands on the one below");
+        app.key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(tests_rs), "up went by distance instead of back the way it came");
+
+        app.select(file_00);
+        app.key(KeyCode::Down, KeyModifiers::NONE);
+        app.key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(file_00), "the second visit did not replace the first");
+    }
+
+    /// The trail only ever picks between nodes the arrow was already willing
+    /// to go to. Once the one it remembers is not among them, distance has
+    /// the answer back.
+    #[test]
+    fn a_remembered_neighbour_that_is_gone_gives_the_answer_back_to_distance() {
+        let mut app = app();
+        let (file_00, file_01, tests_rs) = (EntityId(2), EntityId(3), EntityId(10));
+
+        app.select(tests_rs);
+        app.key(KeyCode::Down, KeyModifiers::NONE);
+        app.key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(tests_rs), "the trail should be holding tests.rs");
+
+        app.key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!drawn(&app, tests_rs), "x did not hide the node the trail remembers");
+
+        app.select(file_01);
+        app.key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(file_00), "up followed a node that is no longer in the picture");
+    }
+
+    /// Tab asks to be inside something, so a shut node opens on the way in
+    /// rather than making the user press enter first. Leaving a box and going
+    /// back into it returns to the child that was left, not to the first one.
+    #[test]
+    fn tab_opens_a_shut_node_and_returns_to_the_child_it_left() {
+        let mut app = app_with(fixture(), Rect::new(0, 0, 60, 20));
+        let (root, inner) = (EntityId(0), EntityId(1));
+        app.select(root);
+        assert!(!app.scene.is_box(root), "the fixture should start shut");
+
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.scene.is_box(root), "tab did not open the node it was going into");
+        assert_eq!(app.selected, Some(inner), "tab did not land inside what it opened");
+
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        let first = app.selected.expect("tab opened the folder and went in");
+        assert!(is_under(&app.graph, first, inner), "tab left the box it opened");
+
+        app.key(KeyCode::Down, KeyModifiers::NONE);
+        let left_at = app.selected.expect("the focus is still on a node");
+        assert_ne!(left_at, first, "fixture should let the focus move off the first child");
+
+        app.key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(inner), "shift-tab did not go out to the box around");
+        app.key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.selected, Some(left_at), "tab went to the first child, not the one it left");
     }
 
     /// Option- or control-arrow is a drag by keyboard: the node lands a step over, the

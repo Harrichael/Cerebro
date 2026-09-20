@@ -379,11 +379,7 @@ pub fn render(labels: &Labels, scene: &Scene, d: &Diagram, lit: Lit) -> Rendered
         let r = n.rect;
         for y in r.y..r.bottom() {
             for x in r.x..r.right() {
-                let floor = n.is_box
-                    && x > r.x
-                    && x + 1 < r.right()
-                    && y >= r.y + INSET.1 as u16
-                    && y + 1 < r.bottom();
+                let floor = n.holds((x, y));
                 mask[usize::from(y) * w + usize::from(x)] = if floor { n.depth } else { SOLID };
             }
         }
