@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn an_edge_is_braille_between_its_nodes_and_never_over_them() {
         let graph = graph_from_parents(
-            &[("root", Folder, None), ("caller.rs", File, Some(0)), ("callee.rs", File, Some(0))],
+            &[("root", Folder, None), ("caller.rs", File, Some(0)), ("callee.rs", File, Some(0)), ("stray.rs", File, None)],
             &[(1, 2, Call)],
         );
         let labels = Labels::new(&graph);
@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn selecting_a_box_repaints_it_without_wiping_what_is_inside() {
         let graph = graph_from_parents(
-            &[("root", Folder, None), ("a.rs", File, Some(0)), ("b.rs", File, Some(0))],
+            &[("root", Folder, None), ("a.rs", File, Some(0)), ("b.rs", File, Some(0)), ("stray.rs", File, None)],
             &[],
         );
         let labels = Labels::new(&graph);
@@ -621,13 +621,12 @@ mod tests {
         );
         let labels = Labels::new(&graph);
         let scene = Scene::new(&graph, &fully_expanded(&graph));
-        // Hand-built: `wall` spans the full interior between a and b.
+        // Hand-built: `wall` spans the full width between a and b.
         let d = Diagram {
             nodes: vec![
-                crate::layout::Placed { id: EntityId(0), rect: Rect::new(0, 0, 16, 16), is_box: true, depth: 1 },
-                crate::layout::Placed { id: EntityId(1), rect: Rect::new(2, 2, 12, 3), is_box: false, depth: 2 },
-                crate::layout::Placed { id: EntityId(2), rect: Rect::new(2, 6, 12, 3), is_box: false, depth: 2 },
-                crate::layout::Placed { id: EntityId(3), rect: Rect::new(2, 11, 12, 3), is_box: false, depth: 2 },
+                crate::layout::Placed { id: EntityId(1), rect: Rect::new(2, 2, 12, 3), is_box: false, depth: 1 },
+                crate::layout::Placed { id: EntityId(2), rect: Rect::new(2, 6, 12, 3), is_box: false, depth: 1 },
+                crate::layout::Placed { id: EntityId(3), rect: Rect::new(2, 11, 12, 3), is_box: false, depth: 1 },
             ],
             edges: scene.edges.clone(),
             width: 16,
@@ -692,7 +691,7 @@ mod tests {
     #[test]
     fn a_box_is_a_tinted_area_and_a_leaf_a_lighter_card_on_it() {
         let graph = graph_from_parents(
-            &[("root", Folder, None), ("a.rs", File, Some(0))],
+            &[("root", Folder, None), ("a.rs", File, Some(0)), ("stray.rs", File, None)],
             &[],
         );
         let labels = Labels::new(&graph);

@@ -886,6 +886,7 @@ mod tests {
                 ("a.rs", File, Some(0)),
                 ("b.rs", File, Some(0)),
                 ("c.rs", File, Some(0)),
+                ("stray.rs", File, None),
             ],
             &[],
         );
@@ -1131,6 +1132,8 @@ mod tests {
                 ("l2.rs", File, Some(1)),
                 ("r1.rs", File, Some(2)),
                 ("r2.rs", File, Some(2)),
+                // A second root: alone, `root` would be the canvas, not a box.
+                ("stray.rs", File, None),
             ],
             &[(3, 5, Call), (3, 4, Call)],
         )
