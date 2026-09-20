@@ -13,8 +13,18 @@ use ratatui::layout::Rect;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-/// Length of the perpendicular leg out of each port.
-const STUB: f32 = 1.5;
+/// Lengths of the perpendicular leg out of each port, longest first.
+///
+/// A stub that starts inside a neighbour has no route at all: `taut_path`
+/// gives up before the search runs. Measured by driving this repo, that was
+/// *every* routing failure there was and a third of all edges drawn -- a
+/// port two cells from the node facing it is ordinary, and the leg wants
+/// one and a half. So a blocked stub is tried shorter before the margin is
+/// given up on: air around the line matters more than the length of its
+/// first leg.
+const STUBS: [f32; 3] = [1.5, 0.75, 0.25];
+/// What a line wants, for the arithmetic that shapes it.
+const STUB: f32 = STUBS[0];
 /// Inflation of the rects an edge must keep clear of. 1.5 puts the runs that
 /// hug an obstacle on the centre of the second cell out, leaving one clear
 /// cell of air between node and line.
@@ -42,6 +52,15 @@ const SMOOTH_ROUNDS: usize = 2;
 const EPS: f32 = 1e-3;
 
 type P = (f32, f32);
+
+/// How hard a route is trying: how far it keeps off what is in its way, and
+/// how long a leg it leaves its port by. Both are given up in turn when no
+/// path can be found, air before leg length.
+#[derive(Debug, Clone, Copy)]
+struct Effort {
+    margin: f32,
+    stub: f32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Side {
@@ -145,18 +164,24 @@ pub fn route(
     others: &[Rect],
     within: Option<Rect>,
 ) -> Route {
-    let sp = step(from.at, from.side, STUB);
-    let tp = step(to.at, to.side, STUB);
     let heading = (from.side.outward(), neg(to.side.outward()));
     // Roomy first, then tight: a line with air round it reads better, but a
-    // line that hugs its neighbours still beats one drawn through them.
+    // line that hugs its neighbours still beats one drawn through them. The
+    // stub shortens within each, since a shorter first leg with air round the
+    // rest reads better than a full one pressed against a neighbour.
     for margin in [MARGIN, TIGHT_MARGIN] {
-        let field = Field::new(sp, tp, from_rect, to_rect, others, within, margin);
-        if let Some(taut) = field.taut_path() {
-            let points = field.bend(&taut, heading, from.at, to.at);
-            return Route { points, clean: true };
+        for stub in STUBS {
+            let effort = Effort { margin, stub };
+            let sp = step(from.at, from.side, stub);
+            let tp = step(to.at, to.side, stub);
+            let field = Field::new(sp, tp, from_rect, to_rect, others, within, effort);
+            if let Some(taut) = field.taut_path() {
+                let points = field.bend(&taut, heading, from.at, to.at);
+                return Route { points, clean: true };
+            }
         }
     }
+    let (sp, tp) = (step(from.at, from.side, STUB), step(to.at, to.side, STUB));
     let mut points = vec![from.at];
     points.extend(hermite(&[sp, tp], &tangents(&[sp, tp], heading, 1.0)));
     points.push(to.at);
@@ -184,7 +209,7 @@ struct Field {
     from: Bx,
     to: Bx,
     bounds: Option<Bx>,
-    margin: f32,
+    effort: Effort,
 }
 
 impl Field {
@@ -195,8 +220,9 @@ impl Field {
         to_rect: Rect,
         others: &[Rect],
         within: Option<Rect>,
-        margin: f32,
+        effort: Effort,
     ) -> Field {
+        let margin = effort.margin;
         let from = Bx::of(from_rect, 0.0);
         let to = Bx::of(to_rect, 0.0);
         let region = from.hull(&to).hull(&Bx::point(sp)).hull(&Bx::point(tp)).grown(REGION);
@@ -223,7 +249,7 @@ impl Field {
             let tight = b.grown(-(margin - 0.5).max(0.0));
             if tight.x1 - tight.x0 >= 1.0 && tight.y1 - tight.y0 >= 1.0 { tight } else { b }
         });
-        Field { sp, tp, obstacles, raw, from, to, bounds, margin }
+        Field { sp, tp, obstacles, raw, from, to, bounds, effort }
     }
 
     fn inside(&self, p: P) -> bool {
@@ -303,7 +329,7 @@ impl Field {
     /// there may be someone else's; if even a slight curve touches something
     /// the path is merely rounded, which never leaves the margin.
     fn bend(&self, taut: &[P], heading: (P, P), start: P, end: P) -> Vec<P> {
-        let check = (self.margin - 0.5).max(TIGHT_MARGIN);
+        let check = (self.effort.margin - 0.5).max(TIGHT_MARGIN);
         for tau in TENSIONS {
             let curve = hermite(taut, &tangents(taut, heading, tau));
             if self.clear(&curve, check) {
@@ -327,13 +353,15 @@ impl Field {
                 return false;
             }
             for (rect, stub) in &ends {
-                if dist(a, *stub) > STUB && dist(b, *stub) > STUB && crosses(a, b, rect) {
+                let tol = self.effort.stub;
+                if dist(a, *stub) > tol && dist(b, *stub) > tol && crosses(a, b, rect) {
                     return false;
                 }
             }
             if let Some(bounds) = &self.bounds {
                 let out = |p: P| !bounds.grown(EPS).contains_open(p);
-                if out(a) && out(b) && dist(a, self.sp) > STUB && dist(a, self.tp) > STUB {
+                let tol = self.effort.stub;
+                if out(a) && out(b) && dist(a, self.sp) > tol && dist(a, self.tp) > tol {
                     return false;
                 }
             }
@@ -724,6 +752,31 @@ mod tests {
         }
     }
 
+    /// A neighbour sitting right off the port swallows the leg the line
+    /// leaves by, and a leg that starts inside an obstacle has no route at
+    /// all -- the search gives up before it runs. Measured by driving this
+    /// repo, that was every routing failure there was and a third of every
+    /// edge drawn. So the leg gives way rather than the route: it shortens
+    /// until it clears, and the line is drawn instead of abandoned.
+    #[test]
+    fn a_leg_that_starts_inside_a_neighbour_shortens_instead_of_giving_up() {
+        let (a, b) = (rect(10, 0, 10, 4), rect(10, 20, 10, 4));
+        // Two rows under a's bottom edge, square under the port it leaves
+        // by: nearer than the leg is long, at either margin.
+        let under = [rect(13, 6, 4, 3)];
+        let r = connect(a, b, &under);
+        println!("{}", picture(&[a, b, under[0]], &r));
+        assert!(r.clean, "a shorter leg clears the neighbour and the rest has a way round");
+        assert_eq!(r.points.first(), Some(&port_at(a, Side::Bottom, 0, 1)));
+        assert_eq!(r.points.last(), Some(&port_at(b, Side::Top, 0, 1)));
+
+        // Control: pull the neighbour clear and the full-length leg is used,
+        // so the line still leaves straight down.
+        let clear = connect(a, b, &[rect(13, 12, 4, 3)]);
+        assert!(clear.clean);
+        assert_eq!(clear.points[0].0, clear.points[1].0, "does not leave straight down");
+    }
+
     #[test]
     fn walled_in_route_falls_back_to_a_direct_curve() {
         // A ring close enough to `a` to count as an obstacle on every side.
@@ -765,7 +818,8 @@ mod tests {
         // Control: before smoothing, the same path has a right angle in it.
         let sp = step(f.at, Side::Bottom, STUB);
         let tp = step(t.at, Side::Left, STUB);
-        let raw = Field::new(sp, tp, a, b, &[block], None, MARGIN).taut_path().unwrap();
+        let effort = Effort { margin: MARGIN, stub: STUB };
+        let raw = Field::new(sp, tp, a, b, &[block], None, effort).taut_path().unwrap();
         assert!((max_turn(&raw) - 90.0).abs() < 1e-3, "taut path is not an L: {raw:?}");
     }
 
