@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Gets cerebro onto a macOS or Linux box from nothing:
 #
-#     curl -fsSL https://raw.githubusercontent.com/Harrichael/Terraform/main/get-cerebro.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/Harrichael/Cerebro/main/get-cerebro.sh | bash
 #
 # There is no binary to download -- cerebro is built here, from source -- so
 # the machine needs a Rust toolchain and a C linker. This script will not
@@ -13,7 +13,7 @@
 # (where the checkout lives), CEREBRO_REPO, CEREBRO_REF.
 set -euo pipefail
 
-REPO="${CEREBRO_REPO:-https://github.com/Harrichael/Terraform}"
+REPO="${CEREBRO_REPO:-https://github.com/Harrichael/Cerebro}"
 REF="${CEREBRO_REF:-main}"
 SRC="${CEREBRO_SRC:-${XDG_CACHE_HOME:-$HOME/.cache}/cerebro/src}"
 

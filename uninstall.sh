@@ -6,7 +6,7 @@ set -euo pipefail
 
 # Mirrors the TOOLS list in install.sh.
 TOOLS=(
-  "graph-server:terraform-http"
+  "graph-server:cerebro-http"
   "graph-tui:cerebro"
 )
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"

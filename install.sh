@@ -11,7 +11,7 @@ cd "$HERE"
 # receipt, so it has to survive a binary rename -- otherwise the old receipt is
 # orphaned and the old binary along with it.
 TOOLS=(
-  "graph-server:terraform-http:--features scip"
+  "graph-server:cerebro-http:--features scip"
   "graph-tui:cerebro:"
 )
 

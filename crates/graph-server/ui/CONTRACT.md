@@ -33,13 +33,13 @@ served extensionless (`/ui/vendor/hljs/rust`) to match the import-map prefix
 ## GET /graph.json  — the raw entity graph
 ```json
 {
-  "root": "Terraform",
+  "root": "myapp",
   "generation": 3,
   "remap": { "from": 2, "ids": [0, 1, null, 4] },
   "nodes": [
-    { "id": 0, "kind": "folder", "name": "Terraform", "path": "Terraform",
+    { "id": 0, "kind": "folder", "name": "myapp", "path": "myapp",
       "line_start": 0, "line_end": 0, "parent": null, "loc": 41 },
-    { "id": 1, "kind": "file", "name": "main.rs", "path": "Terraform/main.rs",
+    { "id": 1, "kind": "file", "name": "main.rs", "path": "myapp/main.rs",
       "line_start": 0, "line_end": 40, "parent": 0, "loc": 41 }
   ],
   "references": [

@@ -1,8 +1,8 @@
-# Terraform
+# Cerebro
 
 > **Form your codebase to a new molding. Rapidly understand and edit your code.**
 
-Terraform is an open-source, terminal-based platform for reimagining how developers interact with and edit code. Built in Rust using [ratatui](https://github.com/ratatui-org/ratatui) and [crossterm](https://github.com/crossterm-rs/crossterm), it provides a highly extensible TUI environment where different tools and "apps" can plug in to transform the editing experience.
+Cerebro is an open-source, terminal-based platform for reimagining how developers interact with and edit code. Built in Rust using [ratatui](https://github.com/ratatui-org/ratatui) and [crossterm](https://github.com/crossterm-rs/crossterm), it provides a highly extensible TUI environment where different tools and "apps" can plug in to transform the editing experience.
 
 ---
 
@@ -43,7 +43,7 @@ macOS or Linux, and a machine that can build Rust:
 ### cerebro, in one line
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Harrichael/Terraform/main/get-cerebro.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Harrichael/Cerebro/main/get-cerebro.sh | bash
 ```
 
 It clones into `~/.cache/cerebro/src`, builds, and puts `cerebro` in
@@ -60,15 +60,15 @@ parses instead, matching references by name.
 ### Build from source
 
 ```bash
-git clone https://github.com/Harrichael/Terraform
-cd Terraform
+git clone https://github.com/Harrichael/Cerebro
+cd Cerebro
 cargo build --release
 ```
 
-The binaries land in `target/release/`: `cerebro` and `terraform-http`.
+The binaries land in `target/release/`: `cerebro` and `cerebro-http`.
 
 `./install.sh` deploys the commands from a checkout: `cerebro` and
-`terraform-http` (with SCIP support) into `~/.local/bin`, recording what it
+`cerebro-http` (with SCIP support) into `~/.local/bin`, recording what it
 deployed under `~/.local/state/<package>`. Name one — `./install.sh cerebro` —
 to build only that. `./uninstall.sh` reverses it, and takes the same argument.
 
@@ -98,22 +98,22 @@ selected entity, `ctrl-w h` comes back to it, and `?` lists the rest.
 
 ### Browser viewer
 
-Installed as `terraform-http` (see Installation); from a checkout, substitute
-`cargo run -p graph-server --features scip --` for `terraform-http`.
+Installed as `cerebro-http` (see Installation); from a checkout, substitute
+`cargo run -p graph-server --features scip --` for `cerebro-http`.
 
 ```bash
 # Serve the graph at http://127.0.0.1:7878/ (tree-sitter)
-terraform-http .
+cerebro-http .
 
 # Build the graph from a SCIP index instead: generate one (rust-analyzer,
 # scip-typescript or scip-go, picked from the manifest; cached under the
 # system temp dir) or point at an existing one
-terraform-http --scip-index .
-terraform-http --scip index.scip .
+cerebro-http --scip-index .
+cerebro-http --scip index.scip .
 
 # Diff view: the union of a git ref and the working tree, tagged by change
-terraform-http --diff main .
-terraform-http --diff main --scip-index .
+cerebro-http --diff main .
+cerebro-http --diff main --scip-index .
 ```
 
 The toolbar's **tests** checkbox hides test code (`#[cfg(test)]` items,
