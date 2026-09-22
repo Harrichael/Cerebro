@@ -13,8 +13,9 @@
 //! - references deduplicated on `(from, to, kind)`, with self-loops dropped
 //!   after Block/Line-level endpoints are lifted to their enclosing entity.
 //!
-//! The intermediate [`tree::CodeTree`] is an implementation detail retained
-//! from the original TUI; `graph_from_path` is the only supported entry point.
+//! Parsing lands in an intermediate [`tree::CodeTree`] before it becomes
+//! entities, and that tree is nobody's business but this crate's:
+//! `graph_from_path` is the only way in.
 
 mod builder;
 mod parser;

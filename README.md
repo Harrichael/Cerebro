@@ -8,16 +8,26 @@ Terraform is an open-source, terminal-based platform for reimagining how develop
 
 ## Features
 
-### Hierarchical Code Viewer (Flagship App)
+### cerebro — the codebase as a diagram
 
-The first — and flagship — app treats every line of source code as a node in a dynamic tree. Users can:
+`cerebro` draws a project as boxes and lines in the terminal. A box is a
+folder, a file, or a struct; a line is a call, an import, a type used. Open a
+box and the one node becomes several — and the lines that named the box are
+still there, because a file is what `use crate::x;` points at.
 
-- **Open a directory or file directly** — Pass any path (or none to open `.`). Directory roots expand through Folder → File → code constructs.
-- **Switch granularity per node** — Use `l`/`Right` and `h`/`Left` to expand or shrink the detail level of a *single* node without affecting its siblings. Granularity levels: Folder → Module → File → Class/Struct → Function → Block (if/for/while) → Line.
-- **Filter nodes instantly** — Type a pattern to narrow the view to matching names or content.
-- **Symbolic references (Lib section)** — Symbols defined in multiple files are deduplicated; the canonical definition is promoted to a `[Lib]` section at the bottom, and duplicates become `[ref]` nodes. Press `Enter` on a `[ref]` node to jump to the definition.
-- **Multi-language support** — Rust, Python, and JavaScript powered by [Tree-sitter](https://tree-sitter.github.io/). Plain text files are shown line-by-line.
-- **Keyboard-driven** — Fast, mouse-free navigation throughout.
+- **Open one box at a time** — `↵` expands what is selected into its children,
+  `⌫` folds it back, and everything else stays where you put it.
+- **References a compiler agrees with** — the graph is built from a SCIP index,
+  generated on demand by rust-analyzer, scip-typescript or scip-go.
+  `--treesitter` trades exactness for starting at once, matching by name.
+- **Your Neovim in the right-hand pane** — `o` opens the selected entity in it,
+  your config and colours and all. `ctrl-w d` on an identifier selects whatever
+  it refers to; `:w` rebuilds the diagram around what you changed, keeping the
+  expansion you had.
+- **Mouse or keyboard** — drag a box, sweep out a group, scroll to pan,
+  ctrl-scroll to zoom. Or never leave the home row.
+
+`?` inside cerebro lists every key.
 
 ---
 
@@ -55,7 +65,7 @@ cd Terraform
 cargo build --release
 ```
 
-The TUI binary will be at `target/release/terraform`.
+The binaries land in `target/release/`: `cerebro` and `terraform-http`.
 
 `./install.sh` deploys the commands from a checkout: `cerebro` and
 `terraform-http` (with SCIP support) into `~/.local/bin`, recording what it
@@ -67,17 +77,24 @@ to build only that. `./uninstall.sh` reverses it, and takes the same argument.
 ## Usage
 
 ```bash
-# Open the current directory (default)
-terraform
+# Draw the current directory (default), indexing it if the index is stale
+cerebro
 
-# Open a specific directory
-terraform path/to/project/
+# A specific directory, or one file
+cerebro path/to/project/
+cerebro path/to/file.rs
 
-# Open a single source file
-terraform path/to/file.rs
+# Parse with tree-sitter instead of indexing: starts at once, and the
+# references are matched by name rather than resolved
+cerebro --treesitter .
+
+# Draw an index you already have
+cerebro --scip index.scip .
 ```
 
-When opening a directory, the view starts at **File granularity** — only folders and files are shown. Use `l`/`Right` on a file to drill into its code constructs.
+It opens on the project root as a single box. `↵` opens it, and keeps opening
+whatever is selected; `⌫` goes back. `o` puts Neovim beside the diagram on the
+selected entity, `ctrl-w h` comes back to it, and `?` lists the rest.
 
 ### Browser viewer
 
@@ -107,34 +124,23 @@ with the references it makes.
 
 ## Keyboard Shortcuts
 
+`?` inside cerebro is the list, kept next to the code that handles the keys so
+it cannot drift. The ones worth knowing before you start:
+
 | Key | Action |
 |-----|--------|
-| `↑` / `k` | Move cursor up |
-| `↓` / `j` | Move cursor down |
-| `PgUp` | Page up |
-| `PgDn` | Page down |
-| `g` / `Home` | Jump to top |
-| `G` / `End` | Jump to bottom |
-| **`l` / `→`** | **Expand cursor node to next finer granularity** |
-| **`h` / `←`** | **Shrink cursor node to next coarser granularity** |
-| `Space` | Toggle full collapse/expand of cursor node |
-| `Enter` | Toggle collapse, or jump to SymRef definition |
-| `[` | Collapse all nodes |
-| `]` | Expand all nodes |
-| `/` | Enter filter mode |
-| `Esc` | Clear filter / cancel |
-| `?` / `F1` | Toggle help overlay |
-| `q` / `Ctrl+C` | Quit |
-
-### Granularity Levels
-
-From coarsest to finest:
-
-```
-Folder → Module → File → Class/Struct → Function/Method → Block (if/for/while) → Line
-```
-
-`l`/`Right` expands one step finer; `h`/`Left` shrinks one step coarser. Changes apply **only to the node under the cursor** — siblings are unaffected.
+| `↵` / `+` | Expand the selected node into its children |
+| `⌫` / `-` | Collapse it back into its parent |
+| `↑ ↓ ← →` | Move the selection to the nearest node that way |
+| `tab` / `⇧tab` | Focus into the box under the cursor, or out to the one around it |
+| `o` / `ctrl-w l` | Open the editor pane, and go to it |
+| `ctrl-w h` | From the pane, back to the diagram |
+| `ctrl-w d` | In the pane: select whatever the word under the cursor refers to |
+| `scroll` / `⇧scroll` | Pan up and down, or left and right |
+| `ctrl-scroll` / `z` | Zoom: the same graph drawn larger or smaller |
+| `L` | Lay the whole picture out afresh |
+| `?` | Every key, with what it does |
+| `q` / `esc` / `ctrl-c` | Quit |
 
 ---
 
@@ -147,17 +153,12 @@ never learn which producer built it.
 crates/
 ├── entity-graph/         # The contract: Entity, EntityGraph, Reference (+ test_support fixtures)
 ├── treesitter-producer/  # Source files → EntityGraph via tree-sitter; one fn: graph_from_path
-├── coalesce/             # Cursor: which entities are in view at this zoom, and the edges between them
+├── scip-producer/        # SCIP index → EntityGraph, plus `index` to run rust-analyzer/scip-typescript/scip-go
+├── coalesce/             # Cursor: a cut through the containment tree, and the references projected onto it
 ├── graph-diff/           # Two EntityGraphs of one project → one union graph tagged by change
-├── scip-producer/        # SCIP index → EntityGraph, plus `indexer` to run rust-analyzer/scip-typescript/scip-go
+├── nvim-ui/              # A headless Neovim spoken to over msgpack-rpc, drawn into a ratatui Buffer
+├── graph-tui/            # cerebro: the diagram, its layout and edge routing, and the editor pane
 └── graph-server/         # localhost viewer: raw/coalesced graph, inspector, git diff view
-src/                      # The TUI (bin `terraform`)
-├── main.rs               # Entry point, terminal setup, render loop
-├── app/state.rs          # AppState — loading, zoom/fold navigation state
-├── graph/
-│   ├── navigator.rs      # Projects the coalesced view into a renderable GraphTree
-│   └── tree.rs           # GraphTree — spanning-forest layout of the reference graph
-└── ui/                   # ratatui rendering and keyboard handling
 ```
 
 `graph-diff` is the odd one out: it consumes two graphs and produces one. Its
@@ -172,6 +173,9 @@ ordinal), which is why a rename reads as a removal plus an addition.
 
 ### Node Kinds
 
+A kind is a role, not a depth: any kind may hold any other, and any of them
+may be either end of a reference.
+
 | Kind | Description |
 |------|-------------|
 | `Folder` | Directory |
@@ -179,8 +183,6 @@ ordinal), which is why a rename reads as a removal plus an addition.
 | `File` | Source file |
 | `Class` | `struct`, `enum`, `trait`, `impl`, `class`, `interface`, `type alias`, SQL table/view |
 | `Function` | `fn`, method, `def`, TypeScript method signature |
-| `Block` | `if`/`for`/`while`/`match`/`switch` constructs, SQL statements |
-| `Line` | Individual source lines |
 
 ---
 
@@ -190,7 +192,9 @@ ordinal), which is why a rename reads as a removal plus an addition.
 |-----------|---------|
 | TUI framework | [ratatui](https://github.com/ratatui-org/ratatui) |
 | Terminal backend | [crossterm](https://github.com/crossterm-rs/crossterm) |
+| Resolved references | [SCIP](https://github.com/sourcegraph/scip), via rust-analyzer, scip-typescript, scip-go |
 | Parsing | [tree-sitter](https://tree-sitter.github.io/) (Rust, Python, JavaScript, TypeScript, TSX, SQL) |
+| Editor pane | [Neovim](https://neovim.io/), headless, over msgpack-rpc |
 | CLI arguments | [clap](https://github.com/clap-rs/clap) |
 
 ---

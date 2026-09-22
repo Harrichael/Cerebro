@@ -25,36 +25,6 @@ impl NodeKind {
         }
     }
 
-    /// One step coarser. Returns `None` if already at the coarsest level.
-    pub fn coarser(&self) -> Option<NodeKind> {
-        match self {
-            NodeKind::Module => Some(NodeKind::Folder),
-            NodeKind::File => Some(NodeKind::Module),
-            NodeKind::Class => Some(NodeKind::File),
-            NodeKind::Function => Some(NodeKind::Class),
-            NodeKind::Block => Some(NodeKind::Function),
-            NodeKind::Line => Some(NodeKind::Block),
-            NodeKind::Folder => None,
-        }
-    }
-
-    /// One step finer. Returns `None` if already at the finest level.
-    pub fn finer(&self) -> Option<NodeKind> {
-        match self {
-            NodeKind::Folder => Some(NodeKind::Module),
-            NodeKind::Module => Some(NodeKind::File),
-            NodeKind::File => Some(NodeKind::Class),
-            NodeKind::Class => Some(NodeKind::Function),
-            NodeKind::Function => Some(NodeKind::Block),
-            NodeKind::Block => Some(NodeKind::Line),
-            NodeKind::Line => None,
-        }
-    }
-
-    /// True if this kind is at a finer granularity than `other`.
-    pub fn is_finer_than(&self, other: &NodeKind) -> bool {
-        self.level() > other.level()
-    }
 }
 
 impl std::fmt::Display for NodeKind {
@@ -183,11 +153,6 @@ pub struct CodeNode {
     pub parent: Option<usize>,
     /// Indices of direct children (in insertion order).
     pub children: Vec<usize>,
-    /// Whether this node is currently collapsed (all children hidden).
-    pub collapsed: bool,
-    /// Granularity limit: only show children whose kind is at most this
-    /// level of detail. `None` means "show all children".
-    pub granularity_limit: Option<NodeKind>,
 }
 
 impl CodeNode {
@@ -211,19 +176,9 @@ impl CodeNode {
             depth,
             parent,
             children: Vec::new(),
-            collapsed: false,
-            granularity_limit: None,
         }
     }
 
-    /// True when this node has no children.
-    pub fn is_leaf(&self) -> bool {
-        self.children.is_empty()
-    }
-
-    pub fn full_display_name(&self) -> String {
-        self.name.clone()
-    }
 }
 
 /// Arena-allocated tree of code nodes for a single file or directory workspace.
@@ -283,97 +238,12 @@ impl CodeTree {
         self.nodes.get(id)
     }
 
-    pub fn get_mut(&mut self, id: usize) -> Option<&mut CodeNode> {
-        self.nodes.get_mut(id)
-    }
-
-    /// Toggle the collapsed state of a node.
-    pub fn toggle_collapse(&mut self, id: usize) {
-        if let Some(n) = self.nodes.get_mut(id) {
-            n.collapsed = !n.collapsed;
-        }
-    }
-
-    /// Expand the granularity of node `id`: show one finer level of children.
-    ///
-    /// If currently showing all children (no limit), this is a no-op.
-    /// If there is a limit, it moves one step finer; reaching the finest
-    /// level removes the limit entirely (show everything).
-    pub fn expand_granularity(&mut self, id: usize) {
-        if let Some(node) = self.nodes.get_mut(id) {
-            match &node.granularity_limit {
-                None => {} // Already at maximum detail.
-                Some(current) => {
-                    // Move one step finer; None means "remove limit" (show all).
-                    node.granularity_limit = current.finer();
-                    node.collapsed = false;
-                }
-            }
-        }
-    }
-
-    /// Shrink the granularity of node `id`: hide one finer level of children.
-    ///
-    /// Steps from "show all" → Block → Function → Class → File → Module →
-    /// Folder → collapsed.
-    pub fn shrink_granularity(&mut self, id: usize) {
-        if let Some(node) = self.nodes.get_mut(id) {
-            // Clone the current limit to avoid a simultaneous borrow conflict.
-            let current_limit = node.granularity_limit.clone();
-            match current_limit {
-                None => {
-                    // Currently showing all — hide Lines.
-                    node.granularity_limit = Some(NodeKind::Block);
-                }
-                Some(current) => {
-                    match current.coarser() {
-                        Some(coarser) => {
-                            node.granularity_limit = Some(coarser);
-                        }
-                        None => {
-                            // Already at Folder level — collapse completely.
-                            node.collapsed = true;
-                            node.granularity_limit = None;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Set detail text for a node.
     #[allow(dead_code)]
     pub fn set_detail(&mut self, id: usize, detail: impl Into<String>) {
         if let Some(n) = self.nodes.get_mut(id) {
             n.detail = Some(detail.into());
         }
-    }
-
-    /// Return the visible nodes in DFS pre-order, respecting `collapsed` and
-    /// `granularity_limit` flags.
-    pub fn visible_nodes(&self) -> Vec<&CodeNode> {
-        let Some(root) = self.root else {
-            return Vec::new();
-        };
-        let mut result = Vec::new();
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            let node = &self.nodes[id];
-            result.push(node);
-            if !node.collapsed {
-                for &child in node.children.iter().rev() {
-                    let child_node = &self.nodes[child];
-                    // Respect the per-node granularity limit.
-                    if let Some(ref limit) = node.granularity_limit {
-                        if child_node.kind.is_finer_than(limit) {
-                            continue;
-                        }
-                    }
-                    stack.push(child);
-                }
-            }
-        }
-        result
     }
 
     /// Return all nodes (visible or not) in DFS pre-order.
@@ -391,22 +261,6 @@ impl CodeTree {
             }
         }
         result
-    }
-
-    /// Filter visible nodes by a text pattern (case-insensitive substring match
-    /// on name and detail).
-    pub fn filter_visible<'a>(&'a self, pattern: &str) -> Vec<&'a CodeNode> {
-        let pat = pattern.to_ascii_lowercase();
-        self.visible_nodes()
-            .into_iter()
-            .filter(|n| {
-                n.name.to_ascii_lowercase().contains(&pat)
-                    || n.detail
-                        .as_deref()
-                        .map(|d| d.to_ascii_lowercase().contains(&pat))
-                        .unwrap_or(false)
-            })
-            .collect()
     }
 
     #[allow(dead_code)]
@@ -503,127 +357,10 @@ impl CodeTree {
         result
     }
 
-    /// Walk the parent chain of `node_id` upward and return the first ancestor
-    /// (inclusive) that appears in `visible_set`.
-    ///
-    /// Returns `None` if neither `node_id` nor any ancestor is visible (e.g.
-    /// the whole subtree is collapsed above the root).
-    fn first_visible_ancestor(
-        &self,
-        node_id: usize,
-        visible_set: &std::collections::HashSet<usize>,
-    ) -> Option<usize> {
-        let mut current = node_id;
-        loop {
-            if visible_set.contains(&current) {
-                return Some(current);
-            }
-            let node = self.nodes.get(current)?;
-            match node.parent {
-                Some(pid) => current = pid,
-                None => return None,
-            }
-        }
-    }
-
-    /// Project every reference edge onto the set of currently visible nodes.
-    ///
-    /// For each edge `(from, to)` in the [`ReferenceGraph`], both endpoints
-    /// are walked up the contains hierarchy until a visible node is reached.
-    /// This handles **mixed granularity**: if one file is expanded (its
-    /// functions are visible) while the other is collapsed (only the file node
-    /// is visible), the edge appears as `(fn_a, file_b)` rather than
-    /// `(file_a, file_b)`.
-    ///
-    /// Self-loops and edges where either endpoint has no visible ancestor are
-    /// dropped.  The result is deduplicated.
-    ///
-    /// Visible ancestors are cached per unique endpoint ID so that nodes
-    /// referenced by many edges (e.g. a widely-used function) only pay the
-    /// parent-chain traversal cost once.
-    pub fn project_refs_onto_visible(&self, visible_ids: &[usize]) -> Vec<(usize, usize)> {
-        use std::collections::{HashMap, HashSet};
-        let visible_set: HashSet<usize> = visible_ids.iter().copied().collect();
-
-        // Pre-compute the visible ancestor for each unique referenced node so that
-        // nodes appearing in many edges are traversed only once.
-        let mut ancestor_cache: HashMap<usize, Option<usize>> = HashMap::new();
-        for edge in self.references.references() {
-            for &node_id in &[edge.from, edge.to] {
-                ancestor_cache
-                    .entry(node_id)
-                    .or_insert_with(|| self.first_visible_ancestor(node_id, &visible_set));
-            }
-        }
-
-        let mut seen: HashSet<(usize, usize)> = HashSet::new();
-        let mut result = Vec::new();
-        for edge in self.references.references() {
-            let (Some(from_vis), Some(to_vis)) = (
-                ancestor_cache.get(&edge.from).copied().flatten(),
-                ancestor_cache.get(&edge.to).copied().flatten(),
-            ) else {
-                continue;
-            };
-            if from_vis != to_vis && seen.insert((from_vis, to_vis)) {
-                result.push((from_vis, to_vis));
-            }
-        }
-        result
-    }
-
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
-    pub fn nodes_iter(&self) -> impl Iterator<Item = &CodeNode> {
-        self.nodes.iter()
-    }
-
-    /// Collect all node IDs in the subtree rooted at root_id.
-    pub fn subtree_ids(&self, root_id: usize) -> std::collections::HashSet<usize> {
-        let mut result = std::collections::HashSet::new();
-        let mut stack = vec![root_id];
-        while let Some(id) = stack.pop() {
-            result.insert(id);
-            if let Some(node) = self.nodes.get(id) {
-                for &child in &node.children {
-                    stack.push(child);
-                }
-            }
-        }
-        result
-    }
-
-    /// Count reference edges from the subtree of `from_root` to the subtree of `to_root`.
-    pub fn cross_ref_count(&self, from_root: usize, to_root: usize) -> usize {
-        let from_set = self.subtree_ids(from_root);
-        let to_set = self.subtree_ids(to_root);
-        self.references
-            .references()
-            .iter()
-            .filter(|r| from_set.contains(&r.from) && to_set.contains(&r.to))
-            .count()
-    }
-
-    /// Compute the full path of a node from the tree root (e.g. "src/app/state.rs").
-    pub fn full_path(&self, node_id: usize) -> String {
-        let mut parts = Vec::new();
-        let mut current = node_id;
-        loop {
-            if let Some(node) = self.nodes.get(current) {
-                parts.push(node.name.clone());
-                match node.parent {
-                    Some(pid) => current = pid,
-                    None => break,
-                }
-            } else {
-                break;
-            }
-        }
-        parts.reverse();
-        parts.join("/")
-    }
 }
 
 #[cfg(test)]
@@ -651,154 +388,9 @@ mod tests {
     }
 
     #[test]
-    fn test_visible_nodes_full() {
-        let tree = sample_tree();
-        let vis = tree.visible_nodes();
-        assert_eq!(vis.len(), 4);
-    }
-
-    #[test]
-    fn test_collapse_hides_subtree() {
-        let mut tree = sample_tree();
-        tree.toggle_collapse(1);
-        let vis = tree.visible_nodes();
-        assert_eq!(vis.len(), 3); // root, fn_foo, fn_bar (line hidden)
-    }
-
-    #[test]
-    fn test_collapse_root_hides_all_children() {
-        let mut tree = sample_tree();
-        tree.toggle_collapse(0);
-        let vis = tree.visible_nodes();
-        assert_eq!(vis.len(), 1); // only root
-    }
-
-    #[test]
-    fn test_double_toggle_restores() {
-        let mut tree = sample_tree();
-        tree.toggle_collapse(1);
-        tree.toggle_collapse(1);
-        assert_eq!(tree.visible_nodes().len(), 4);
-    }
-
-    #[test]
-    fn test_granularity_limit_hides_fine_children() {
-        let mut tree = sample_tree();
-        // Set fn_foo (id=1) to only show children up to Function level.
-        // fn_foo's direct children are Lines (level 6 > Function level 4) → hidden.
-        tree.get_mut(1).unwrap().granularity_limit = Some(NodeKind::Function);
-        let vis = tree.visible_nodes();
-        // root + fn_foo (its Line child hidden) + fn_bar = 3
-        assert_eq!(vis.len(), 3);
-        assert!(vis.iter().all(|n| n.kind != NodeKind::Line));
-    }
-
-    #[test]
-    fn test_granularity_limit_none_shows_all() {
-        let mut tree = sample_tree();
-        tree.get_mut(0).unwrap().granularity_limit = None;
-        assert_eq!(tree.visible_nodes().len(), 4);
-    }
-
-    #[test]
-    fn test_shrink_granularity_from_none() {
-        let mut tree = sample_tree();
-        // Shrink from None → Block limit (hide Lines)
-        tree.shrink_granularity(0);
-        let node = tree.get(0).unwrap();
-        assert_eq!(node.granularity_limit, Some(NodeKind::Block));
-    }
-
-    #[test]
-    fn test_shrink_granularity_from_block_to_function() {
-        let mut tree = sample_tree();
-        tree.get_mut(0).unwrap().granularity_limit = Some(NodeKind::Block);
-        tree.shrink_granularity(0);
-        let node = tree.get(0).unwrap();
-        assert_eq!(node.granularity_limit, Some(NodeKind::Function));
-    }
-
-    #[test]
-    fn test_expand_granularity_from_function_to_block() {
-        let mut tree = sample_tree();
-        tree.get_mut(0).unwrap().granularity_limit = Some(NodeKind::Function);
-        tree.expand_granularity(0);
-        let node = tree.get(0).unwrap();
-        assert_eq!(node.granularity_limit, Some(NodeKind::Block));
-    }
-
-    #[test]
-    fn test_expand_granularity_from_block_to_line() {
-        // Block.finer() = Some(Line), so expanding from Block gives Line limit.
-        let mut tree = sample_tree();
-        tree.get_mut(0).unwrap().granularity_limit = Some(NodeKind::Block);
-        tree.expand_granularity(0);
-        let node = tree.get(0).unwrap();
-        assert_eq!(node.granularity_limit, Some(NodeKind::Line));
-    }
-
-    #[test]
-    fn test_expand_granularity_from_line_to_none() {
-        // Line.finer() = None, so expanding from Line removes the limit.
-        let mut tree = sample_tree();
-        tree.get_mut(0).unwrap().granularity_limit = Some(NodeKind::Line);
-        tree.expand_granularity(0);
-        let node = tree.get(0).unwrap();
-        assert_eq!(node.granularity_limit, None);
-    }
-
-    #[test]
-    fn test_expand_granularity_from_none_noop() {
-        let mut tree = sample_tree();
-        tree.expand_granularity(0);
-        assert_eq!(tree.get(0).unwrap().granularity_limit, None);
-    }
-
-    #[test]
-    fn test_filter_visible() {
-        let tree = sample_tree();
-        let res = tree.filter_visible("foo");
-        assert_eq!(res.len(), 1);
-        assert_eq!(res[0].name, "fn_foo");
-    }
-
-    #[test]
-    fn test_filter_visible_empty_pattern() {
-        let tree = sample_tree();
-        assert_eq!(tree.filter_visible("").len(), 4);
-    }
-
-    #[test]
-    fn test_filter_case_insensitive() {
-        let tree = sample_tree();
-        assert_eq!(tree.filter_visible("FN_FOO").len(), 1);
-    }
-
-    #[test]
-    fn test_node_is_leaf() {
-        let tree = sample_tree();
-        assert!(!tree.get(0).unwrap().is_leaf());
-        assert!(tree.get(2).unwrap().is_leaf()); // Line node
-    }
-
-    #[test]
     fn test_nodekind_level_ordering() {
         assert!(NodeKind::Folder.level() < NodeKind::Line.level());
         assert!(NodeKind::Function.level() < NodeKind::Block.level());
-    }
-
-    #[test]
-    fn test_nodekind_coarser_finer() {
-        assert_eq!(NodeKind::Function.coarser(), Some(NodeKind::Class));
-        assert_eq!(NodeKind::Function.finer(), Some(NodeKind::Block));
-        assert_eq!(NodeKind::Folder.coarser(), None);
-        assert_eq!(NodeKind::Line.finer(), None);
-    }
-
-    #[test]
-    fn test_is_finer_than() {
-        assert!(NodeKind::Line.is_finer_than(&NodeKind::Function));
-        assert!(!NodeKind::File.is_finer_than(&NodeKind::Function));
     }
 
     // -----------------------------------------------------------------------
@@ -948,58 +540,4 @@ mod tests {
     // project_refs_onto_visible tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_project_refs_both_collapsed_gives_file_edge() {
-        let mut tree = two_file_tree();
-        // fn_a1 (2) → fn_b1 (5); both files collapsed → only folder(0), file_a(1), file_b(4) visible.
-        tree.add_reference(2, 5, ReferenceKind::Call);
-        let visible = vec![0usize, 1, 4]; // folder, file_a, file_b (functions collapsed)
-        let proj = tree.project_refs_onto_visible(&visible);
-        assert_eq!(proj.len(), 1);
-        assert!(proj.contains(&(1, 4)));
-    }
-
-    #[test]
-    fn test_project_refs_one_expanded_gives_mixed_edge() {
-        let mut tree = two_file_tree();
-        // fn_a1 (2) → fn_b1 (5); file_a expanded, file_b collapsed.
-        tree.add_reference(2, 5, ReferenceKind::Call);
-        let visible = vec![0usize, 1, 2, 3, 4]; // folder, file_a, fn_a1, fn_a2, file_b
-        let proj = tree.project_refs_onto_visible(&visible);
-        assert_eq!(proj.len(), 1);
-        // fn_a1 is visible, fn_b1 is not → walks up to file_b.
-        assert!(proj.contains(&(2, 4)));
-    }
-
-    #[test]
-    fn test_project_refs_both_expanded_gives_function_edge() {
-        let mut tree = two_file_tree();
-        tree.add_reference(2, 5, ReferenceKind::Call);
-        let visible = vec![0usize, 1, 2, 3, 4, 5, 6]; // all nodes
-        let proj = tree.project_refs_onto_visible(&visible);
-        assert_eq!(proj.len(), 1);
-        assert!(proj.contains(&(2, 5)));
-    }
-
-    #[test]
-    fn test_project_refs_intra_file_drops_self_loop_when_collapsed() {
-        let mut tree = two_file_tree();
-        // fn_a1 (2) → fn_a2 (3); both in file_a; when file_a is collapsed both map to file_a.
-        tree.add_reference(2, 3, ReferenceKind::Call);
-        let visible = vec![0usize, 1, 4]; // file_a collapsed
-        let proj = tree.project_refs_onto_visible(&visible);
-        // Both endpoints project to file_a (1) → self-loop, dropped.
-        assert!(proj.is_empty());
-    }
-
-    #[test]
-    fn test_project_refs_deduplicates() {
-        let mut tree = two_file_tree();
-        // Multiple function-level edges from a→b; all should deduplicate.
-        tree.add_reference(2, 5, ReferenceKind::Call);
-        tree.add_reference(3, 6, ReferenceKind::Call);
-        let visible = vec![0usize, 1, 4]; // both files collapsed
-        let proj = tree.project_refs_onto_visible(&visible);
-        assert_eq!(proj.len(), 1);
-    }
 }

@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use crate::{Entity, EntityGraph, EntityId, EntityKind, Reference, ReferenceKind};
 
-/// A bare entity with no children and a synthetic `<name>.rs` path. Wire
-/// `children` yourself or use [`graph_from_parents`].
-pub fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<EntityId>) -> Entity {
+/// A bare entity with no children and a synthetic `<name>.rs` path; the
+/// containment is wired up by `graph_from_parents`, which is what callers use.
+fn make_entity(id: usize, name: &str, kind: EntityKind, parent: Option<EntityId>) -> Entity {
     Entity {
         id: EntityId(id),
         kind,

@@ -1866,20 +1866,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "terraform-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "coalesce",
- "crossterm",
- "entity-graph",
- "ratatui",
- "tempfile",
- "treesitter-producer",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

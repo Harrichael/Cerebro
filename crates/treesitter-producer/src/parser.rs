@@ -147,13 +147,7 @@ struct RawRef {
 }
 
 fn add_folder(tree: &mut CodeTree, name: impl Into<String>, depth: usize, parent: Option<usize>) -> usize {
-    let id = tree.add_node(NodeKind::Folder, name, (0, 0), (0, 0), depth, parent);
-    // Folders start at File-level granularity so only folders/files are shown
-    // until the user explicitly drills down.
-    if let Some(n) = tree.get_mut(id) {
-        n.granularity_limit = Some(NodeKind::File);
-    }
-    id
+    tree.add_node(NodeKind::Folder, name, (0, 0), (0, 0), depth, parent)
 }
 
 /// List `dir` recursively: directories first, then files, both alphabetical,
@@ -868,8 +862,6 @@ fn example() {
         let src = "line one\nline two\nline three";
         let tree = parse_source(src, &SourceLanguage::PlainText, "notes.txt").unwrap();
         assert_eq!(tree.len(), 1); // just the file root, no children
-        let vis = tree.visible_nodes();
-        assert_eq!(vis.len(), 1);
     }
 
     #[test]
