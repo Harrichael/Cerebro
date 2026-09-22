@@ -13,21 +13,6 @@ fn test_cursor_initialization() {
     let cursor = Cursor::new(&graph);
 
     assert_eq!(cursor.active(), &[EntityId(0)]);
-    assert_eq!(cursor.references.len(), 0);
-}
-
-#[test]
-fn test_cursor_with_references() {
-    let graph = graph_from_parents(
-        &[("root", Folder, None), ("module_a", Module, Some(0)), ("module_b", Module, Some(0))],
-        &[(1, 2, Call)],
-    );
-
-    let cursor = Cursor::new(&graph);
-
-    assert_eq!(cursor.references.len(), 1);
-    assert_eq!(cursor.references[0].reference_id, ReferenceId(0));
-    assert_eq!(cursor.references[0].kind, Call);
 }
 
 #[test]
@@ -140,11 +125,11 @@ fn test_coalesced_through_expansions() {
     );
     let mut cursor = Cursor::new(&graph);
 
-    assert_eq!(cursor.coalesced(), Coalesced { leaves: ids(&[0]), edges: vec![] });
+    assert_eq!(cursor.coalesced(&graph), Coalesced { leaves: ids(&[0]), edges: vec![] });
 
     assert!(cursor.move_down(EntityId(0), &graph));
     assert_eq!(
-        cursor.coalesced(),
+        cursor.coalesced(&graph),
         Coalesced {
             leaves: ids(&[1, 2]),
             edges: vec![
@@ -157,7 +142,7 @@ fn test_coalesced_through_expansions() {
 
     assert!(cursor.move_down(EntityId(1), &graph));
     assert_eq!(
-        cursor.coalesced(),
+        cursor.coalesced(&graph),
         Coalesced {
             leaves: ids(&[2, 3, 4]),
             edges: vec![
@@ -172,7 +157,7 @@ fn test_coalesced_through_expansions() {
 
     assert!(cursor.move_down(EntityId(2), &graph));
     assert_eq!(
-        cursor.coalesced(),
+        cursor.coalesced(&graph),
         Coalesced {
             leaves: ids(&[3, 4, 5, 6]),
             edges: vec![
@@ -186,11 +171,12 @@ fn test_coalesced_through_expansions() {
     );
 }
 
-/// A file-level import has nowhere to go once the file itself is expanded
-/// into: its endpoint is no longer a leaf and no child contains it. The
-/// coalesced view must not emit edges to entities that are not leaves.
+/// A container is a node, so an edge may end on one. `a.rs` imports the
+/// *file* `b.rs`; opening either of them must not take that line away, and
+/// once `a.rs` is open the import leaves the box rather than any function in
+/// it, because no function is what the line named.
 #[test]
-fn test_coalesced_drops_edges_to_expanded_endpoints() {
+fn opening_a_file_keeps_the_lines_that_named_the_file() {
     let graph = graph_from_parents(
         &[
             ("root", Folder, None),
@@ -199,26 +185,58 @@ fn test_coalesced_drops_edges_to_expanded_endpoints() {
             ("fn_a", Function, Some(1)),
             ("fn_b", Function, Some(2)),
         ],
-        &[(1, 4, Import), (3, 4, Call)],
+        &[(1, 2, Import), (3, 4, Call)],
     );
     let mut cursor = Cursor::new(&graph);
     assert!(cursor.move_down(EntityId(0), &graph));
     assert_eq!(
-        cursor.coalesced(),
+        cursor.coalesced(&graph),
         Coalesced {
-            leaves: vec![EntityId(1), EntityId(2)],
+            leaves: ids(&[1, 2]),
             edges: vec![edge(1, 2, Import, &[0]), edge(1, 2, Call, &[1])],
         }
     );
 
-    // Expand a.rs: the Call re-homes to fn_a, the Import's source is now
-    // the inactive a.rs and must disappear rather than dangle.
     assert!(cursor.move_down(EntityId(1), &graph));
     assert_eq!(
-        cursor.coalesced(),
+        cursor.coalesced(&graph),
         Coalesced {
-            leaves: vec![EntityId(2), EntityId(3)],
-            edges: vec![edge(3, 2, Call, &[1])],
-        }
+            leaves: ids(&[2, 3]),
+            edges: vec![edge(1, 2, Import, &[0]), edge(3, 2, Call, &[1])],
+        },
+        "the import names the file, so it stays on the file"
     );
+}
+
+/// An expansion is a cut through the tree and nothing else, so the same cut
+/// has to give the same picture however the user got there. Opening `sub`'s
+/// first file and then collapsing the whole of `sub` used to lose the edge
+/// into it, because the projection was carried along instead of derived.
+#[test]
+fn the_picture_depends_on_the_cut_and_not_on_the_route_to_it() {
+    let graph = graph_from_parents(
+        &[
+            ("root", Folder, None),
+            ("app.rs", File, Some(0)),
+            ("sub", Folder, Some(0)),
+            ("inner1.rs", File, Some(2)),
+            ("inner2.rs", File, Some(2)),
+            ("deep", Function, Some(3)),
+        ],
+        &[(1, 3, Call)],
+    );
+    let (sub, inner1, inner2) = (EntityId(2), EntityId(3), EntityId(4));
+
+    let mut wandered = Cursor::new(&graph);
+    assert!(wandered.move_down(EntityId(0), &graph));
+    assert!(wandered.move_down(sub, &graph));
+    assert!(wandered.move_down(inner1, &graph));
+    assert!(wandered.move_up(inner2, &graph));
+
+    let mut direct = Cursor::new(&graph);
+    assert!(direct.move_down(EntityId(0), &graph));
+
+    assert_eq!(direct.active(), wandered.active(), "the two cursors should be at the same cut");
+    assert_eq!(wandered.coalesced(&graph), direct.coalesced(&graph));
+    assert_eq!(direct.coalesced(&graph).edges, vec![edge(1, 2, Call, &[0])]);
 }

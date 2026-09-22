@@ -97,7 +97,7 @@ impl Navigator {
     ///   tree exactly once.
     fn sync_tree(&mut self) {
         self.view_tree = GraphTree::new();
-        let coalesced = self.cursor.coalesced();
+        let coalesced = self.cursor.coalesced(&self.graph);
 
         // All active leaves must exist before any edges are wired.
         for &leaf in &coalesced.leaves {

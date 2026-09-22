@@ -1009,11 +1009,11 @@ mod tests {
         let mut cursor = coalesce::Cursor::new(graph);
         loop {
             let mut moved = false;
-            for leaf in cursor.coalesced().leaves {
+            for leaf in cursor.coalesced(graph).leaves {
                 moved |= cursor.move_down(leaf, graph);
             }
             if !moved {
-                return crate::view::apply(graph, &cursor.coalesced(), &Default::default());
+                return crate::view::apply(graph, &cursor.coalesced(graph), &Default::default());
             }
         }
     }
@@ -1302,7 +1302,7 @@ mod tests {
     }
 
     fn picture_at(graph: &EntityGraph, cursor: &coalesce::Cursor) -> Picture {
-        crate::view::apply(graph, &cursor.coalesced(), &Default::default())
+        crate::view::apply(graph, &cursor.coalesced(graph), &Default::default())
     }
 
     /// Expanding a node grows it from its own origin and its siblings make

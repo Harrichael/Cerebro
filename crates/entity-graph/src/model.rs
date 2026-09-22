@@ -8,8 +8,12 @@ pub struct EntityId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ReferenceId(pub usize);
 
-/// Kind of code construct that an entity represents.
-/// These form a hierarchy from coarsest (Folder) to finest (Function).
+/// What kind of code construct an entity is.
+///
+/// A role, not a depth. These do not form a ladder: a function holds a struct
+/// in any Rust test module, a class holds a class, a module holds a module.
+/// Containment is whatever the producer found, and is asked of `parent` and
+/// `children` rather than inferred from here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntityKind {
     Folder,
@@ -111,12 +115,14 @@ pub struct Entity {
 /// Stores two independent structures:
 ///
 /// 1. **Contains topology** — the parent/child relationships captured in each
-///    [`Entity`], forming the syntactic hierarchy (Folder → Module → File →
-///    Class → Function).
+///    [`Entity`]. Any kind may hold any other; the nesting is the producer's
+///    reading of the source, not a fixed order of kinds.
 ///
 /// 2. **Reference graph** — directed edges representing symbolic relationships
 ///    (calls, imports, type refs, etc.) between entities, independent of
-///    containment.
+///    containment. Any entity may be an end of one: a file is what
+///    `use crate::x;` names and a struct is what `let p: Point` names, so
+///    holding things and being pointed at are independent of each other.
 pub struct EntityGraph {
     /// Arena-allocated entities; index == entity.id.0
     pub entities: Vec<Entity>,

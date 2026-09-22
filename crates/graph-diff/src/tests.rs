@@ -181,7 +181,7 @@ fn the_union_graph_drives_a_cursor() {
     let root = d.graph.entities.iter().find(|e| e.parent.is_none()).unwrap().id;
     assert!(cursor.move_down(root, &d.graph));
     assert!(cursor.move_down(id_of(&d.graph, "proj/src"), &d.graph));
-    let view = cursor.coalesced();
+    let view = cursor.coalesced(&d.graph);
     assert!(view.leaves.contains(&id_of(&d.graph, "proj/src/gone.rs")));
     assert!(view.edges.iter().all(|e| !e.refs.is_empty()));
 }

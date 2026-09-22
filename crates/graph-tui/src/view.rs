@@ -5,11 +5,11 @@
 //! Today that is the test filter, edge collapse, hiding and scoping; bundling
 //! joins them here when it arrives.
 //!
-//! [`Picture`] deliberately is not `coalesce::Coalesced`, near-identical as it
-//! looks today. A bundled edge ends on a *box*, which is not a cursor leaf, so
-//! the moment bundling arrives the node set stops being expressible in the
-//! cursor's vocabulary. Owning the type now keeps that a change to our own
-//! struct rather than a change to somebody's signature.
+//! `nodes` is the cut -- what is drawn with nothing of its own inside it.
+//! An edge may end above the cut, on a box, because a box is a thing you can
+//! point at: `use crate::x;` names a file and does not stop naming it when
+//! the file is opened. The boxes themselves are not listed, since they are
+//! exactly the ancestors of `nodes` and `scene` derives them anyway.
 
 use std::collections::BTreeSet;
 
@@ -105,11 +105,21 @@ pub fn apply(graph: &EntityGraph, coalesced: &Coalesced, settings: &Settings) ->
         })
         .collect();
 
-    let kept: std::collections::BTreeSet<EntityId> = nodes.iter().copied().collect();
+    // An edge may end on a container rather than a leaf, because a container
+    // is what `use crate::x;` names. It stays in the picture for as long as
+    // anything under it does.
+    let mut shown: std::collections::BTreeSet<EntityId> = nodes.iter().copied().collect();
+    for &leaf in &nodes {
+        let mut cur = graph.get(leaf).and_then(|e| e.parent);
+        while let Some(c) = cur {
+            shown.insert(c);
+            cur = graph.get(c).and_then(|e| e.parent);
+        }
+    }
     let mut edges: Vec<Edge> = coalesced
         .edges
         .iter()
-        .filter(|e| kept.contains(&e.from) && kept.contains(&e.to))
+        .filter(|e| shown.contains(&e.from) && shown.contains(&e.to))
         .map(|e| Edge { from: e.from, to: e.to, kind: e.kind, refs: e.refs.clone() })
         .collect();
 
@@ -143,11 +153,11 @@ mod tests {
         let mut cursor = coalesce::Cursor::new(graph);
         loop {
             let mut moved = false;
-            for leaf in cursor.coalesced().leaves {
+            for leaf in cursor.coalesced(graph).leaves {
                 moved |= cursor.move_down(leaf, graph);
             }
             if !moved {
-                return cursor.coalesced();
+                return cursor.coalesced(graph);
             }
         }
     }

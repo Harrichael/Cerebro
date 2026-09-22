@@ -415,7 +415,7 @@ impl App {
     /// `anchor` is what the camera keeps still through the change; `opts` is
     /// what a drag in flight asks: its nodes anchored, their levels left alone.
     fn rebuild_with(&mut self, anchor: Anchor, opts: &Options) {
-        let picture = view::apply(&self.graph, &self.cursor.coalesced(), &self.settings);
+        let picture = view::apply(&self.graph, &self.cursor.coalesced(&self.graph), &self.settings);
         self.scene = Scene::new(&self.graph, &picture);
         let labels = Labels::new(&self.graph);
         // Nodes the layout has never seen are ranked into place; everything
@@ -1744,7 +1744,7 @@ mod tests {
         let mut app = app_with(fixture(), Rect::new(0, 0, 60, 20));
         // Expand to the files; the root alone has nothing to scroll or select.
         for _ in 0..2 {
-            for leaf in app.cursor.coalesced().leaves {
+            for leaf in app.cursor.coalesced(&app.graph).leaves {
                 app.cursor.move_down(leaf, &app.graph);
             }
         }
@@ -2755,7 +2755,7 @@ mod tests {
             std::sync::Arc::new(move || treesitter_producer::graph_from_path(&reread));
         let mut app = App::new(graph, Rect::new(0, 0, 120, 20), root, inputs, loader);
         for _ in 0..4 {
-            for leaf in app.cursor.coalesced().leaves {
+            for leaf in app.cursor.coalesced(&app.graph).leaves {
                 app.cursor.move_down(leaf, &app.graph);
             }
         }

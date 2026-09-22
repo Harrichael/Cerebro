@@ -64,8 +64,14 @@ pub fn lineage(graph: &EntityGraph, id: EntityId) -> Vec<EntityId> {
 impl Scene {
     pub fn new(graph: &EntityGraph, picture: &Picture) -> Scene {
         let leaves: BTreeSet<EntityId> = picture.nodes.iter().copied().collect();
-        let chains: BTreeMap<EntityId, Vec<EntityId>> =
-            leaves.iter().map(|&l| (l, lineage(graph, l))).collect();
+        // Edge endpoints as well as leaves: an edge may end on a box, and a
+        // box needs its own chain here or lifting below cannot place it.
+        let chains: BTreeMap<EntityId, Vec<EntityId>> = leaves
+            .iter()
+            .copied()
+            .chain(picture.edges.iter().flat_map(|e| [e.from, e.to]))
+            .map(|id| (id, lineage(graph, id)))
+            .collect();
 
         // Containers worth drawing: every ancestor of a visible leaf. A chain
         // of single-child containers is kept, not collapsed -- the folder
@@ -73,7 +79,7 @@ impl Scene {
         let mut kids: BTreeMap<EntityId, Vec<EntityId>> = BTreeMap::new();
         let mut parent: BTreeMap<EntityId, EntityId> = BTreeMap::new();
         let mut roots: Vec<EntityId> = Vec::new();
-        for chain in chains.values() {
+        for chain in leaves.iter().filter_map(|l| chains.get(l)) {
             if !roots.contains(&chain[0]) {
                 roots.push(chain[0]);
             }
@@ -104,7 +110,11 @@ impl Scene {
             let (Some(fa), Some(ta)) = (chains.get(&e.from), chains.get(&e.to)) else { continue };
             let split = fa.iter().zip(ta).take_while(|(a, b)| a == b).count();
             if split >= fa.len() || split >= ta.len() {
-                continue; // one endpoint contains the other; there is no pair to draw
+                // One endpoint holds the other -- `impl Point { fn new() -> Point }`
+                // once `Point` is open. A constructor naming its own type is
+                // not news, and a line from inside a box to the box around it
+                // has nowhere to go.
+                continue;
             }
             let (a, b) = (fa[split], ta[split]);
             let level = (split > 0).then(|| fa[split - 1]);
@@ -167,19 +177,19 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use entity_graph::EntityKind::{File, Folder};
-    use entity_graph::ReferenceKind::{Call, Import};
+    use entity_graph::EntityKind::{self, Class, File, Folder};
+    use entity_graph::ReferenceKind::{Call, Import, TypeRef};
     use entity_graph::test_support::graph_from_parents;
 
     fn expanded(graph: &EntityGraph) -> Picture {
         let mut cursor = coalesce::Cursor::new(graph);
         loop {
             let mut moved = false;
-            for leaf in cursor.coalesced().leaves {
+            for leaf in cursor.coalesced(graph).leaves {
                 moved |= cursor.move_down(leaf, graph);
             }
             if !moved {
-                return crate::view::apply(graph, &cursor.coalesced(), &Default::default());
+                return crate::view::apply(graph, &cursor.coalesced(graph), &Default::default());
             }
         }
     }
@@ -218,6 +228,58 @@ mod tests {
         assert_eq!(inside_a.len(), 1);
         assert_eq!((inside_a[0].from, inside_a[0].to), (a1, a2));
         assert_eq!(scene.degree[&a], 1, "the lifted edge counts once against the box");
+    }
+
+    /// A box is a thing you can point at. `app.rs` imports the *file*
+    /// `shapes.rs`, so with both files open the line runs between the two
+    /// boxes -- not between anything inside them -- while a call from a
+    /// function inside one to a function inside the other lifts to the same
+    /// pair. Both survive; neither is invented.
+    #[test]
+    fn a_line_that_named_a_box_is_drawn_between_the_boxes() {
+        let graph = graph_from_parents(
+            &[
+                ("src", Folder, None),
+                ("app.rs", File, Some(0)),
+                ("shapes.rs", File, Some(0)),
+                ("run", EntityKind::Function, Some(1)),
+                ("origin", EntityKind::Function, Some(2)),
+            ],
+            &[(1, 2, Import), (3, 4, Call)],
+        );
+        let (src, app, shapes) = (EntityId(0), EntityId(1), EntityId(2));
+        let scene = Scene::new(&graph, &expanded(&graph));
+
+        assert!(scene.is_box(app) && scene.is_box(shapes));
+        let between: Vec<_> = scene.edges_at(Some(src)).collect();
+        assert_eq!(between.len(), 1, "the import and the call are one line between the files");
+        assert_eq!((between[0].from, between[0].to), (app, shapes));
+        assert_eq!(scene.degree[&shapes], 1);
+    }
+
+    /// `impl Point { fn new() -> Point }`: once `Point` is open, `new` points
+    /// at the box it sits in. That is not news and there is nowhere to draw
+    /// it, so it is not drawn -- while a reference from outside still lands
+    /// on the box.
+    #[test]
+    fn a_line_from_inside_a_box_to_the_box_itself_is_not_drawn() {
+        let graph = graph_from_parents(
+            &[
+                ("lib.rs", File, None),
+                ("Point", Class, Some(0)),
+                ("new", EntityKind::Function, Some(1)),
+                ("caller", EntityKind::Function, Some(0)),
+            ],
+            &[(2, 1, TypeRef), (3, 1, TypeRef)],
+        );
+        let (lib, point, caller) = (EntityId(0), EntityId(1), EntityId(3));
+        let scene = Scene::new(&graph, &expanded(&graph));
+
+        assert!(scene.is_box(point), "a struct with methods is a box");
+        let drawn: Vec<_> = scene.edges_at(Some(lib)).collect();
+        assert_eq!(drawn.len(), 1, "only the line from outside the box is drawn");
+        assert_eq!((drawn[0].from, drawn[0].to), (caller, point));
+        assert!(scene.edges_at(Some(point)).next().is_none());
     }
 
     #[test]

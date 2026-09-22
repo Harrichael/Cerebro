@@ -25,12 +25,12 @@ fn main() -> anyhow::Result<()> {
     let graph = treesitter_producer::graph_from_path(std::path::Path::new(&root))?;
     let mut cursor = coalesce::Cursor::new(&graph);
     for _ in 0..depth {
-        for leaf in cursor.coalesced().leaves {
+        for leaf in cursor.coalesced(&graph).leaves {
             cursor.move_down(leaf, &graph);
         }
     }
 
-    let picture = view::apply(&graph, &cursor.coalesced(), &Settings::default());
+    let picture = view::apply(&graph, &cursor.coalesced(&graph), &Settings::default());
     let labels = Labels::new(&graph);
     let scene = Scene::new(&graph, &picture);
     let mut layout = Layout::new();

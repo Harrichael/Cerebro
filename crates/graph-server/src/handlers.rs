@@ -400,7 +400,7 @@ fn search(snap: &Snapshot, query: Option<&str>) -> Response {
 // reset that dropped the lock before rendering could answer with some other
 // request's move once requests are served concurrently.
 fn coalesced_response(snap: &Snapshot, cursor: &Cursor) -> Response {
-    let coalesced = cursor.coalesced();
+    let coalesced = cursor.coalesced(&snap.graph);
     let status = snap.diff.as_ref().map(|d| d.reference_status.as_slice());
     ok(JSON, serde_json::to_vec(&dto::coalesced_dto(&coalesced, status, snap.generation)).unwrap())
 }

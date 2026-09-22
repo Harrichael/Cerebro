@@ -20,8 +20,8 @@ fn main() -> anyhow::Result<()> {
     for (path, depth) in levels {
         let graph = treesitter_producer::graph_from_path(std::path::Path::new(path))?;
         let mut c = coalesce::Cursor::new(&graph);
-        for _ in 0..depth { for l in c.coalesced().leaves { c.move_down(l, &graph); } }
-        let pic = view::apply(&graph, &c.coalesced(), &Default::default());
+        for _ in 0..depth { for l in c.coalesced(&graph).leaves { c.move_down(l, &graph); } }
+        let pic = view::apply(&graph, &c.coalesced(&graph), &Default::default());
         let labels = Labels::new(&graph);
         let scene = Scene::new(&graph, &pic);
         let t0 = Instant::now();
