@@ -1,7 +1,7 @@
 mod geometry;
 mod util;
 
-use geometry::Point;
+use geometry::{Point, Span};
 
 fn main() {
     let p = Point::new(3.0, 4.0);
@@ -10,5 +10,6 @@ fn main() {
 }
 
 fn describe(p: &Point) -> String {
-    format!("{} has magnitude {}", p, p.magnitude())
+    let tag = Span::of("point");
+    format!("{} ({}) has magnitude {}", p, tag.width(), p.magnitude())
 }

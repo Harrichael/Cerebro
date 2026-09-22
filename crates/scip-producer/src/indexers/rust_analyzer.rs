@@ -39,6 +39,10 @@ impl Dialect for RustAnalyzer {
     /// is `ns/Self#`. Trying that before the plain descriptor parent is safe:
     /// whenever it applies, the descriptor parent is the impl block, which
     /// `entity_kind` keeps out of the graph.
+    ///
+    /// A self type outside this module resolves to nothing and falls through,
+    /// which is right -- a method cannot sit inside a type declared in
+    /// another file.
     fn parent_symbol(&self, sym: &ParsedSymbol) -> Option<String> {
         impl_self_type(sym).or_else(|| sym.parent())
     }
@@ -101,6 +105,14 @@ fn impl_index(descriptors: &[Descriptor]) -> Option<usize> {
     .then_some(at)
 }
 
+/// The type that a self-type descriptor names. rust-analyzer spells it as the
+/// source does, generic arguments and all -- `` `Labels<'a>` `` -- while the
+/// type itself is registered under `Labels`. Nothing is registered under a
+/// generic spelling, so dropping the arguments is the only way the two meet.
+fn base_name(spelled: &str) -> &str {
+    spelled.split_once('<').map_or(spelled, |(base, _)| base)
+}
+
 fn impl_self_type(sym: &ParsedSymbol) -> Option<String> {
     let descriptors = sym.descriptors();
     let owner = &descriptors[..descriptors.len().checked_sub(1)?];
@@ -108,7 +120,7 @@ fn impl_self_type(sym: &ParsedSymbol) -> Option<String> {
     let self_type = owner.get(at + 1)?;
     let mut descriptors = owner[..at].to_vec();
     descriptors.push(Descriptor {
-        name: self_type.name.clone(),
+        name: base_name(&self_type.name).to_string(),
         suffix: Suffix::Type.into(),
         ..Default::default()
     });
@@ -135,6 +147,25 @@ mod tests {
 
         let block = ParsedSymbol::parse("rust-analyzer cargo fx 0.1.0 geo/impl#[Point]").unwrap();
         assert_eq!(RustAnalyzer.entity_kind(&block, Kind::TypeAlias), None);
+
+        // A generic impl carries its arguments in the self type's name; the
+        // type itself is registered without them, and nothing else is.
+        let generic = ParsedSymbol::parse(
+            "rust-analyzer cargo fx 0.1.0 geo/impl#[`Span<\'a>`]len().",
+        )
+        .unwrap();
+        assert_eq!(
+            RustAnalyzer.parent_symbol(&generic).as_deref(),
+            Some("rust-analyzer cargo fx 0.1.0 geo/Span#")
+        );
+        let generic_trait = ParsedSymbol::parse(
+            "rust-analyzer cargo fx 0.1.0 geo/impl#[`Span<\'a>`][Display]fmt().",
+        )
+        .unwrap();
+        assert_eq!(
+            RustAnalyzer.parent_symbol(&generic_trait).as_deref(),
+            Some("rust-analyzer cargo fx 0.1.0 geo/Span#")
+        );
 
         // Nothing but an impl block diverts parenting away from the descriptors.
         let plain = ParsedSymbol::parse("rust-analyzer cargo fx 0.1.0 geo/Point#magnitude().").unwrap();

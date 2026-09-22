@@ -18,3 +18,17 @@ impl std::fmt::Display for Point {
         write!(f, "({}, {})", self.x, self.y)
     }
 }
+
+pub struct Span<'a> {
+    pub label: &'a str,
+}
+
+impl<'a> Span<'a> {
+    pub fn of(label: &'a str) -> Span<'a> {
+        Span { label }
+    }
+
+    pub fn width(&self) -> usize {
+        self.label.len()
+    }
+}

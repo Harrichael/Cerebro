@@ -373,8 +373,7 @@ impl<'a> Builder<'a> {
     }
 
     fn references(&mut self) -> Vec<Reference> {
-        let mut index: HashMap<(EntityId, EntityId, ReferenceKind), usize> = HashMap::new();
-        let mut out: Vec<Reference> = Vec::new();
+        let mut hits: Vec<(EntityId, EntityId, ReferenceKind, usize)> = Vec::new();
         for d in 0..self.docs.len() {
             for (o, occ) in self.docs[d].occurrences.iter().enumerate() {
                 if self.claimed.contains(&(d, o)) {
@@ -396,13 +395,41 @@ impl<'a> Builder<'a> {
                     continue;
                 }
                 let kind = self.reference_kind(d, occ, span.start, self.entities[to.0].kind);
-                let site = Site { line: span.start.line };
-                match index.get(&(from, to, kind)) {
-                    Some(&i) => out[i].sites.push(site),
-                    None => {
-                        index.insert((from, to, kind), out.len());
-                        out.push(Reference { from, to, kind, sites: vec![site] });
-                    }
+                hits.push((from, to, kind, span.start.line));
+            }
+        }
+
+        // A path names its own prefixes. `shapes::Point::origin()` is three
+        // occurrences of one reference, and counting them separately draws a
+        // line to the box and another into it for the same call. The
+        // innermost thing the line actually spelled is what it points at,
+        // which is also why `use x::Y;` points at `Y` while a bare `use x;`
+        // and a glob both point at `x`.
+        let mut on_line: HashMap<(EntityId, usize), Vec<usize>> = HashMap::new();
+        for (i, &(from, _, _, line)) in hits.iter().enumerate() {
+            on_line.entry((from, line)).or_default().push(i);
+        }
+        let outer: HashSet<usize> = on_line
+            .values()
+            .flat_map(|group| {
+                group.iter().copied().filter(|&i| {
+                    group.iter().any(|&j| j != i && self.encloses(hits[i].1, hits[j].1))
+                })
+            })
+            .collect();
+
+        let mut index: HashMap<(EntityId, EntityId, ReferenceKind), usize> = HashMap::new();
+        let mut out: Vec<Reference> = Vec::new();
+        for (i, &(from, to, kind, line)) in hits.iter().enumerate() {
+            if outer.contains(&i) {
+                continue;
+            }
+            let site = Site { line };
+            match index.get(&(from, to, kind)) {
+                Some(&i) => out[i].sites.push(site),
+                None => {
+                    index.insert((from, to, kind), out.len());
+                    out.push(Reference { from, to, kind, sites: vec![site] });
                 }
             }
         }
@@ -411,6 +438,18 @@ impl<'a> Builder<'a> {
             r.sites.dedup();
         }
         out
+    }
+
+    /// Is `id` under `ancestor`, and not `ancestor` itself?
+    fn encloses(&self, ancestor: EntityId, id: EntityId) -> bool {
+        let mut cur = self.entities[id.0].parent;
+        while let Some(c) = cur {
+            if c == ancestor {
+                return true;
+            }
+            cur = self.entities[c.0].parent;
+        }
+        false
     }
 
     fn reference_kind(

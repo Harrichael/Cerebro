@@ -120,9 +120,13 @@ fn rust_fixture_maps_methods_under_their_struct_and_links_across_files() {
         ("rust/src/geometry.rs/Point/new", Function),
         ("rust/src/geometry.rs/Point/magnitude", Function),
         ("rust/src/geometry.rs/Point/fmt", Function),
+        ("rust/src/geometry.rs/Span", Class),
+        ("rust/src/geometry.rs/Span/of", Function),
+        ("rust/src/geometry.rs/Span/width", Function),
         ("rust/src/main.rs/main", Function),
         ("rust/src/main.rs/describe", Function),
         ("rust/src/util/mod.rs/greet", Function),
+        ("rust/src/util/mod.rs/origin", Function),
         ("rust/src/util/mod.rs/inner", Module),
         ("rust/src/util/mod.rs/inner/banner", Function),
     ]
@@ -137,6 +141,14 @@ fn rust_fixture_maps_methods_under_their_struct_and_links_across_files() {
     assert_eq!(noun("rust/src/geometry.rs/Point/new"), Some("static method"));
     assert_eq!(noun("rust/src/geometry.rs/Point/magnitude"), Some("method"));
     assert_eq!(noun("rust/src/main.rs/main"), Some("function"));
+
+    // `impl<'a> Span<'a>` is spelled with its generic arguments where
+    // `impl Point` is not, and both must land on the type all the same. A
+    // method that cannot find its owner falls back to the file, silently, so
+    // this is the assertion that catches the next indexer that changes how it
+    // spells a container.
+    assert_parent(&graph, "rust/src/geometry.rs/Span/of", "rust/src/geometry.rs/Span");
+    assert_parent(&graph, "rust/src/geometry.rs/Span/width", "rust/src/geometry.rs/Span");
 
     // Inherent and trait impls both hang off the type, not the file.
     assert_parent(
@@ -185,7 +197,25 @@ fn rust_fixture_maps_methods_under_their_struct_and_links_across_files() {
         "rust/src/geometry.rs/Point",
         Import,
     );
-    assert_edge(&graph, "rust/src/main.rs", "rust/src/geometry.rs", Import);
+    // `use geometry::{Point, Span};` spells out what it wants, so it points
+    // at those and not at the file around them. `mod geometry;` names only
+    // the file, so that is where the file-level link comes from.
+    assert!(
+        !graph.references.iter().any(|r| r.from == id(&graph, "rust/src/main.rs")
+            && r.to == id(&graph, "rust/src/geometry.rs")
+            && r.kind == Import),
+        "the use line names Point and Span, not the file"
+    );
+    assert_edge(&graph, "rust/src/main.rs", "rust/src/geometry.rs", Generic);
+    assert_edge(&graph, "rust/src/main.rs", "rust/src/geometry.rs/Span", Import);
+
+    // The other side of the same rule: a bare `use crate::geometry;` (line 0)
+    // and a glob `use crate::geometry::*;` (line 1) each name the file and
+    // nothing in it, so the file is what they point at.
+    assert_eq!(
+        sites(&graph, "rust/src/util/mod.rs", "rust/src/geometry.rs", Import),
+        vec![0, 1]
+    );
     assert_edge(
         &graph,
         "rust/src/util/mod.rs/greet",
@@ -282,8 +312,15 @@ fn typescript_fixture_uses_utf16_columns_and_suffix_kinds() {
         "ts/src/geometry.ts/origin",
         Call,
     );
+    // `import { Point, origin } from "./geometry"` names both of them, so
+    // that is what it points at -- not the module they came out of.
     assert_edge(&graph, "ts/src/main.ts", "ts/src/geometry.ts/Point", Import);
-    assert_edge(&graph, "ts/src/main.ts", "ts/src/geometry.ts", Import);
+    assert_edge(&graph, "ts/src/main.ts", "ts/src/geometry.ts/origin", Import);
+    assert!(
+        !graph.references.iter().any(|r| r.from == id(&graph, "ts/src/main.ts")
+            && r.to == id(&graph, "ts/src/geometry.ts")),
+        "the import names what it imports"
+    );
 
     // `shout` sits after an emoji on the same line: its UTF-16 column only
     // lands on the right byte if the encoding conversion happened.
@@ -326,11 +363,17 @@ fn go_fixture_resolves_a_package_to_its_directory_not_to_one_of_its_files() {
     // container that point.go declares too.
     assert_parent(&graph, "go/geometry/scale.go/Scale", "go/geometry/scale.go");
 
-    // Importing a package, and qualifying a name with it, both mean the
-    // directory. Naming a file instead would make whichever file sorts first
-    // the target of every package-level reference in the project.
+    // A package means the directory. Naming a file instead would make
+    // whichever file sorts first the target of every package-level reference
+    // in the project. The import line names the package and nothing else, so
+    // it is the one that shows this; `geometry.New(..)` names `New`.
     assert_edge(&graph, "go/main.go", "go/geometry", Import);
-    assert_edge(&graph, "go/main.go/main", "go/geometry", Generic);
+    assert_edge(&graph, "go/main.go/main", "go/geometry/point.go/New", Call);
+    assert!(
+        !graph.references.iter().any(|r| r.from == id(&graph, "go/main.go/main")
+            && r.to == id(&graph, "go/geometry")),
+        "qualifying a name with its package points at the name"
+    );
 
     // A single-line `import "x"` is the form no other fixture line covers:
     // recognising only the `import ( .. )` block would leave this edge Generic.
@@ -402,7 +445,7 @@ fn unknown_indexer_gets_the_protocol_only_graph() {
 
     let graph = scip_producer::graph_from_index(&path, &root).unwrap();
     check_invariants(&graph, "rust");
-    assert_eq!(graph.entities.len(), 15);
+    assert_eq!(graph.entities.len(), 19);
     // Without rust-analyzer's `impl#` reading a method hangs off its file.
     assert_parent(&graph, "rust/src/geometry.rs/new", "rust/src/geometry.rs");
     assert_edge(&graph, "rust/src/main.rs/main", "rust/src/geometry.rs/new", Call);
