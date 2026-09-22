@@ -11,9 +11,21 @@ TOOLS=(
 )
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
+# Mirrors install.sh's argument: remove the named tools, or all of them.
+WANT=("$@")
+
+wanted() {
+  [ ${#WANT[@]} -eq 0 ] && return 0
+  for w in "${WANT[@]}"; do
+    [ "$w" = "$1" ] || [ "$w" = "$2" ] && return 0
+  done
+  return 1
+}
+
 for tool in "${TOOLS[@]}"; do
   PKG="${tool%%:*}"
   BIN="${tool#*:}"
+  wanted "$PKG" "$BIN" || continue
   STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$PKG"
   RECEIPT="$STATE_DIR/receipt"
 

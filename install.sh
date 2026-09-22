@@ -17,6 +17,18 @@ TOOLS=(
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
+# Named tools, or all of them. get-cerebro.sh asks for cerebro alone, and a
+# tool it never installed is a tool it has no business replacing.
+WANT=("$@")
+
+wanted() {
+  [ ${#WANT[@]} -eq 0 ] && return 0
+  for w in "${WANT[@]}"; do
+    [ "$w" = "$1" ] || [ "$w" = "$2" ] && return 0
+  done
+  return 1
+}
+
 command -v cargo >/dev/null 2>&1 || {
   echo "error: cargo not found. install Rust: https://rustup.rs" >&2
   exit 1
@@ -32,11 +44,14 @@ dirty=no
 
 mkdir -p "$INSTALL_DIR"
 
+installed=0
 for tool in "${TOOLS[@]}"; do
   PKG="${tool%%:*}"
   rest="${tool#*:}"
   BIN="${rest%%:*}"
   FLAGS="${rest#*:}"
+  wanted "$PKG" "$BIN" || continue
+  installed=$((installed + 1))
   STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$PKG"
   RECEIPT="$STATE_DIR/receipt"
 
@@ -69,6 +84,11 @@ for tool in "${TOOLS[@]}"; do
 
   echo "==> installed: $INSTALL_DIR/$BIN ($commit$([ "$dirty" = yes ] && echo -dirty))"
 done
+
+if [ "$installed" -eq 0 ]; then
+  echo "error: no such tool: ${WANT[*]}" >&2
+  exit 2
+fi
 
 # Advise, never edit: this repo does not own anyone's shell rc. On a dev-setup
 # machine the entry is already there; anywhere else the hint is the fix.

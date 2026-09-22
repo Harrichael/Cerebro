@@ -25,7 +25,27 @@ The first — and flagship — app treats every line of source code as a node in
 
 ### Prerequisites
 
-- Rust toolchain (1.70+): https://rustup.rs/
+macOS or Linux, and a machine that can build Rust:
+
+- Rust toolchain (1.85+, for edition 2024): https://rustup.rs/
+- a C linker — `xcode-select --install`, or your distribution's `build-essential`
+
+### cerebro, in one line
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Harrichael/Terraform/main/get-cerebro.sh | bash
+```
+
+It clones into `~/.cache/cerebro/src`, builds, and puts `cerebro` in
+`~/.local/bin`. Nothing is downloaded pre-built and no toolchain is installed
+behind your back: anything missing is reported with the one command that
+installs it. Re-run it to update. `INSTALL_DIR`, `CEREBRO_SRC`, `CEREBRO_REPO`
+and `CEREBRO_REF` override where each part goes.
+
+Worth having, none of it required to start: **Neovim** for the editor pane
+(`o`), and an indexer for the language you are reading — `rust-analyzer`,
+`scip-go`, or Node for `scip-typescript`. Without one, `cerebro --treesitter .`
+parses instead, matching references by name.
 
 ### Build from source
 
@@ -37,10 +57,10 @@ cargo build --release
 
 The TUI binary will be at `target/release/terraform`.
 
-To install the browser viewer as a command, run `./install.sh`: it builds
-`terraform-http` (with SCIP support) and copies it to `~/.local/bin`, recording
-what it deployed under `~/.local/state/graph-server`. `./uninstall.sh` reverses
-it.
+`./install.sh` deploys the commands from a checkout: `cerebro` and
+`terraform-http` (with SCIP support) into `~/.local/bin`, recording what it
+deployed under `~/.local/state/<package>`. Name one — `./install.sh cerebro` —
+to build only that. `./uninstall.sh` reverses it, and takes the same argument.
 
 ---
 
