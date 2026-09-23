@@ -21,6 +21,8 @@ use ratatui::widgets::Paragraph;
 use graph_tui::camera::Camera;
 use graph_tui::controls::{self, Control, NodeAction, State};
 use graph_tui::editor::{self, Editor, Handled};
+use graph_tui::pane::{self, Pane, Tab};
+use entity_graph::search::{Limits, TextIndex};
 use graph_tui::label::Labels;
 use graph_tui::layout::{Diagram, Layout, Options};
 use graph_tui::render::{self, Lit, Rendered};
@@ -76,15 +78,41 @@ const KEYS: &[(&str, &str)] = &[
 /// screen from before the last thing nvim did.
 enum Input {
     Term(Event),
-    Pane(nvim_ui::Event),
+    Pane(Tab, nvim_ui::Event),
     /// A rebuild finished. `Err` is what to tell the user instead.
     Reloaded(Box<Result<EntityGraph>>),
 }
+
+/// Lines either side of a match, when the query does not say. None: a match
+/// is a line, and a list of lines is what a search is for. `context:2` in the
+/// query asks for the surroundings when they are what you want.
+const CONTEXT: usize = 0;
+
+/// Enough that paging through results is the limit, not this.
+const SEARCH_LIMITS: Limits = Limits { file: 50, path: 50, content: 2000, symbol: 200 };
 
 /// How long the rebuild thread waits for the writing to stop. Saving three
 /// files in a row is one edit, and re-indexing after each of them would mean
 /// waiting three times for an answer only the last one can give.
 const QUIET: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Bigger than this and a file is not source any more; the cost of folding
+/// it into the index outweighs ever wanting to find something in it.
+const MAX_SOURCE_BYTES: u64 = 2 << 20;
+
+/// Read what the graph names, for the search index. Deliberately not shared
+/// with the server's copy: that one is diff-aware and canonicalises paths
+/// because it answers HTTP, while this one reads the tree it was pointed at.
+fn text_index(graph: &EntityGraph, root: &std::path::Path) -> TextIndex {
+    TextIndex::build(graph, |id| {
+        let rel = graph.file_path(id)?;
+        let path = root.join(&rel);
+        if std::fs::metadata(&path).ok()?.len() > MAX_SOURCE_BYTES {
+            return None;
+        }
+        Some((rel.to_string_lossy().into_owned(), std::fs::read_to_string(&path).ok()?))
+    })
+}
 
 /// Re-read the tree the same way it was read at startup.
 type Loader = std::sync::Arc<dyn Fn() -> Result<EntityGraph> + Send + Sync>;
@@ -152,7 +180,14 @@ struct App {
     /// left it where it was -- most of them, while typing -- is not worth
     /// asking nvim anything about.
     pane_cursor: (std::path::PathBuf, usize),
-    editor: Option<Editor>,
+    /// What is beside the diagram. Owns the divider, because the divider
+    /// outlives anything the pane happens to be showing.
+    pane: Pane,
+    /// Built when something first searches, and dropped when the graph is
+    /// rebuilt: a hit names an entity by its place in the arena, so an index
+    /// from the last generation points into this one. Nobody who never
+    /// searches pays for it.
+    index: Option<TextIndex>,
     focus: Focus,
     /// A `ctrl-w` on the diagram side, waiting for the key that says what it
     /// meant.
@@ -260,7 +295,8 @@ impl App {
             pane_area: Rect::ZERO,
             pane_was: Rect::ZERO,
             pane_cursor: (std::path::PathBuf::new(), usize::MAX),
-            editor: None,
+            pane: Pane::default(),
+            index: None,
             focus: Focus::Graph,
             pending_window: false,
             trouble: None,
@@ -299,6 +335,15 @@ impl App {
         // The pane is showing a file, not an id, so it needs nothing said to
         // it -- but what the diagram thinks its cursor is in has changed.
         self.pane_cursor = (std::path::PathBuf::new(), usize::MAX);
+        // Every hit names an entity by its place in the arena, so results
+        // from the last generation point into this one. The index goes, and
+        // a search that is on screen is asked again rather than left lying.
+        self.index = None;
+        if self.pane.results().is_some() {
+            let focus = self.focus;
+            self.run_search();
+            self.focus = focus;
+        }
         self.rebuild();
     }
 
@@ -325,11 +370,12 @@ impl App {
     /// Start a Neovim beside the diagram, and give it the keyboard -- asking
     /// for the pane is asking to be in it.
     fn open_editor(&mut self) {
-        if self.editor.is_some() {
+        if self.pane.editor().is_some() {
+            self.pane.show(Tab::Editor);
             self.focus = Focus::Pane;
             return;
         }
-        let Some(area) = editor::panes(self.body, Some(self.body.width / 2)).1 else { return };
+        let Some(area) = pane::panes(self.body, Some(self.body.width / 2)).1 else { return };
         match Editor::open(&self.root, area, self.nvim_args) {
             Ok((editor, events)) => {
                 // Nvim redraws on its own schedule, so its events have to
@@ -338,12 +384,13 @@ impl App {
                 let inputs = self.inputs.clone();
                 std::thread::spawn(move || {
                     for event in events {
-                        if inputs.send(Input::Pane(event)).is_err() {
+                        if inputs.send(Input::Pane(Tab::Editor, event)).is_err() {
                             return;
                         }
                     }
                 });
-                self.editor = Some(editor);
+                self.pane.attach(editor, area.width);
+                self.pane.show(Tab::Editor);
                 self.pane_area = area;
                 self.focus = Focus::Pane;
                 self.trouble = None;
@@ -353,9 +400,8 @@ impl App {
                 // Asked once the file is up, since that is when nvim knows
                 // what gutter this file type gets.
                 let most = self.body.width / 2;
-                if let Some(editor) = self.editor.as_mut() {
-                    let wanted = editor.natural_width(most);
-                    editor.set_width(wanted);
+                if let Some(wanted) = self.pane.editor().map(|e| e.natural_width(most)) {
+                    self.pane.set_width(wanted);
                 }
             }
             Err(e) => self.trouble = Some(format!("{e:#}")),
@@ -368,16 +414,21 @@ impl App {
             self.trouble = Some(unsaved);
             return;
         }
-        self.editor = None;
-        self.pane_area = Rect::ZERO;
-        self.focus = Focus::Graph;
+        self.pane.close();
+        // A search that is still up keeps the pane; only the editor went.
+        if self.pane.is_open() {
+            self.pane.show(Tab::Search);
+        } else {
+            self.pane_area = Rect::ZERO;
+            self.focus = Focus::Graph;
+        }
         self.trouble = None;
     }
 
     /// What to say instead of throwing away a buffer somebody is part way
     /// through, or `None` when there is nothing to lose.
     fn unsaved(&self) -> Option<String> {
-        let editor = self.editor.as_ref()?;
+        let editor = self.pane.editor()?;
         let modified = editor
             .nvim()
             .eval("len(filter(getbufinfo({'bufloaded': 1}), 'v:val.changed'))")
@@ -506,7 +557,7 @@ impl App {
     /// tinted. A folder has no file to open, so the pane is left showing
     /// whatever it was showing.
     fn show_in_pane(&mut self, id: EntityId) {
-        let Some(editor) = self.editor.as_ref() else { return };
+        let Some(editor) = self.pane.editor() else { return };
         let (Some(rel), Some(entity)) = (self.graph.file_path(id), self.graph.get(id)) else {
             return;
         };
@@ -533,7 +584,7 @@ impl App {
     /// it -- so this selects the nearest drawn leaf standing for it, the same
     /// rule a click in the browser's code pane follows.
     fn follow_pane_cursor(&mut self) {
-        let Some(editor) = self.editor.as_ref() else { return };
+        let Some(editor) = self.pane.editor() else { return };
         // The line first, because it comes free with the redraw. Asking nvim
         // which file it is showing is a round trip, and a redraw that left
         // the cursor on the line it was on -- every keystroke of typing a
@@ -560,7 +611,7 @@ impl App {
     /// can be clicked through one after another -- the browser's code pane
     /// works the same way, for the same reason.
     fn go_to_definition(&mut self) {
-        let Some(editor) = self.editor.as_ref() else { return };
+        let Some(editor) = self.pane.editor() else { return };
         let Some((line, column, text)) = editor.cursor_site() else { return };
         let file = editor
             .current_file()
@@ -774,7 +825,7 @@ impl App {
     /// them so a control cannot say "on" and do nothing.
     fn state(&self, c: Control) -> State {
         match c {
-            Control::Editor => State::Switch(self.editor.is_some()),
+            Control::Editor => State::Switch(self.pane.editor().is_some()),
             Control::Zoom => State::Level(self.zoom.name()),
             Control::Tests => State::Switch(self.settings.show_tests),
             Control::OnePerPair => State::Switch(self.settings.one_per_pair),
@@ -796,7 +847,7 @@ impl App {
     fn control(&mut self, c: Control) {
         match c {
             Control::Editor => {
-                match self.editor.is_some() {
+                match self.pane.editor().is_some() {
                     true => self.close_editor(),
                     false => self.open_editor(),
                 }
@@ -944,6 +995,50 @@ impl App {
         (v.x + v.width / 2, v.y + v.height / 2)
     }
 
+    /// A click inside the pane. The tab bar chooses a tab; on the search tab
+    /// a row names a result and opening it is a click away; the editor tab
+    /// hands the event to nvim as it always did.
+    fn pane_click(&mut self, ev: MouseEvent) {
+        let area = self.pane_area;
+        if ev.row == area.y {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                // The bar reads " search  nvim ", so the tab is whichever
+                // label the column landed in.
+                match ev.column < area.x + 8 {
+                    true => self.pane.show(pane::Tab::Search),
+                    false => self.show_editor_tab(),
+                }
+            }
+            return;
+        }
+        if self.pane.tab() == pane::Tab::Search {
+            let body = self.pane.body(area);
+            if ev.row < body.y {
+                if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.pane.begin_typing();
+                }
+                return;
+            }
+            if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                return;
+            }
+            let at = self
+                .pane
+                .results()
+                .and_then(|r| r.at_row(ev.row - body.y, body.height).map(|i| i - r.page_start()));
+            if let Some(nth) = at {
+                // Through nvim, so the result the cursor is in and the result
+                // that was clicked are the same thing by construction.
+                self.pane.focus_result(nth);
+                self.open_result();
+            }
+            return;
+        }
+        if let Some(editor) = self.pane.editor() {
+            editor.mouse(ev.kind, ev.column, ev.row, self.pane.body(area));
+        }
+    }
+
     /// Route a mouse event. Scrolling pans, shift turns it sideways and ctrl
     /// zooms -- the same three gestures the browser view uses, so muscle
     /// memory carries over.
@@ -956,12 +1051,9 @@ impl App {
         }
         // Pointing at something says which pane you mean, so the mouse needs
         // no focus rule of its own -- it sets one.
-        if self.editor.is_some() && self.pane_area.contains(Position::new(ev.column, ev.row)) {
+        if self.pane.is_open() && self.pane_area.contains(Position::new(ev.column, ev.row)) {
             self.focus = Focus::Pane;
-            let area = self.pane_area;
-            if let Some(editor) = self.editor.as_ref() {
-                editor.mouse(ev.kind, ev.column, ev.row, area);
-            }
+            self.pane_click(ev);
             return;
         }
         self.focus = Focus::Graph;
@@ -1240,7 +1332,7 @@ impl App {
                 Style::default().fg(Color::Yellow),
             ));
         }
-        if self.editor.is_some() {
+        if self.pane.is_open() {
             spans.push(Span::styled(
                 match self.focus {
                     Focus::Pane => "· pane ".to_string(),
@@ -1260,12 +1352,84 @@ impl App {
         Line::from(spans)
     }
 
+    /// Is `file` part of the picture the diagram is showing? Hiding, scoping
+    /// and the test switch all speak about the graph, and a result list that
+    /// ignored them would be about a different graph than the one on screen.
+    fn shows(&self, file: EntityId) -> bool {
+        let under = |wanted: EntityId| {
+            let mut cur = Some(file);
+            while let Some(c) = cur {
+                if c == wanted {
+                    return true;
+                }
+                cur = self.graph.get(c).and_then(|e| e.parent);
+            }
+            false
+        };
+        if !self.settings.show_tests && self.graph.get(file).is_some_and(|e| e.is_test) {
+            return false;
+        }
+        if self.settings.hidden.iter().any(|&h| under(h)) {
+            return false;
+        }
+        self.settings.scope.is_none_or(under)
+    }
+
+    /// Run what is in the box and show it in the search tab.
+    fn run_search(&mut self) {
+        let query = self.pane.query().trim().to_string();
+        if query.is_empty() {
+            self.pane.cancel_typing();
+            return;
+        }
+        let index = match &self.index {
+            Some(index) => index,
+            None => self.index.insert(text_index(&self.graph, &self.root)),
+        };
+        let found = index.search(&query, SEARCH_LIMITS);
+        let context = found.context.unwrap_or(CONTEXT);
+        let excerpts: Vec<_> = index
+            .excerpts(&found.hits, context)
+            .into_iter()
+            .filter(|e| self.shows(e.file))
+            .collect();
+
+        let wanted = self.pane.width().unwrap_or(self.body.width / 2);
+        let Some(area) = pane::panes(self.body, Some(wanted)).1 else { return };
+        if !self.pane.is_open() {
+            self.pane.set_width(area.width);
+        }
+        let events = self.pane.attach_results(query, excerpts, &self.root, area, self.nvim_args);
+        if let Some(events) = events {
+            let inputs = self.inputs.clone();
+            std::thread::spawn(move || {
+                for event in events {
+                    if inputs.send(Input::Pane(Tab::Search, event)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        self.pane_area = area;
+        self.focus = Focus::Pane;
+    }
+
     /// A press, to whoever has the keyboard. The pane is a whole editor, so
     /// when it is in focus everything goes to it except the `ctrl-w` that
     /// leads back out; see `editor`.
     fn press(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        // The box first, whoever has focus: a query being typed owns every
+        // key, or `q` would quit half way through writing one.
+        if self.pane.typing() {
+            self.type_query(key);
+            return;
+        }
+        if self.focus == Focus::Pane && self.pane.tab() == Tab::Search {
+            self.search_key(key);
+            return;
+        }
         if self.focus == Focus::Pane {
-            match self.editor.as_mut().map(|e| e.key(key)) {
+            match self.pane.editor_mut().map(|e| e.key(key)) {
                 Some(Handled::Pane) => {}
                 Some(Handled::GiveUpFocus) => self.focus = Focus::Graph,
                 Some(Handled::Resize(by)) => self.widen_pane(by),
@@ -1287,6 +1451,85 @@ impl App {
         self.key(key.code, key.modifiers);
     }
 
+    /// While a query is being typed. `ctrl-w` is deliberately not a window
+    /// move here -- it deletes a word, as it does in vim's own cmdline and
+    /// in every readline -- so leaving a box means `esc` first.
+    fn type_query(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('w') if ctrl => self.pane.delete_word(),
+            KeyCode::Char(c) if !ctrl => self.pane.edit_query(c),
+            KeyCode::Backspace => self.pane.backspace_query(),
+            KeyCode::Enter => self.run_search(),
+            KeyCode::Esc => {
+                self.pane.cancel_typing();
+                if !self.pane.is_open() {
+                    self.focus = Focus::Graph;
+                    self.pane_area = Rect::ZERO;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The search tab, once the query is run. The results are windows in a
+    /// Neovim, so moving between them is moving between windows.
+    fn search_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        if std::mem::take(&mut self.pending_window) {
+            match key.code {
+                KeyCode::Char('h') => self.focus = Focus::Graph,
+                KeyCode::Char('l' | 'w') => self.show_editor_tab(),
+                KeyCode::Char('<') => self.widen_pane(-4),
+                KeyCode::Char('>') => self.widen_pane(4),
+                _ => {}
+            }
+            return;
+        }
+        let height = self.pane.body(self.pane_area).height;
+        match key.code {
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.pending_window = true;
+            }
+            KeyCode::Char('/') | KeyCode::Char('i') => self.pane.begin_typing(),
+            KeyCode::Char('j') | KeyCode::Down => self.pane.step_result(true),
+            KeyCode::Char('k') | KeyCode::Up => self.pane.step_result(false),
+            KeyCode::Char(']') | KeyCode::PageDown => self.turn_page(true, height),
+            KeyCode::Char('[') | KeyCode::PageUp => self.turn_page(false, height),
+            KeyCode::Enter => self.open_result(),
+            KeyCode::Esc => self.focus = Focus::Graph,
+            _ => {}
+        }
+    }
+
+    fn turn_page(&mut self, forward: bool, height: u16) {
+        if self.pane.results_mut().is_some_and(|r| r.turn(forward, height)) {
+            self.pane.relay_out();
+        }
+    }
+
+    /// Show the editor tab, opening a Neovim for it if there is not one yet.
+    fn show_editor_tab(&mut self) {
+        if self.pane.editor().is_none() {
+            self.open_editor();
+        }
+        self.pane.show(Tab::Editor);
+        self.focus = Focus::Pane;
+    }
+
+    /// Open the result under the cursor: the whole file, in the editor tab,
+    /// at the line the match is on.
+    fn open_result(&mut self) {
+        let Some((file, line)) = self.pane.current_result() else { return };
+        self.show_editor_tab();
+        let (Some(rel), Some(editor)) = (self.graph.file_path(file), self.pane.editor()) else {
+            return;
+        };
+        let path = self.root.join(rel);
+        if path.is_file() {
+            editor.show(&path, line, None);
+        }
+    }
+
     fn take(&mut self, input: Input) {
         match input {
             // Mouse capture reports every twitch of the pointer. Those change
@@ -1298,16 +1541,18 @@ impl App {
             // The pane repainted. The frame after this picks that up on its
             // own; what needs doing here is noticing whether its cursor moved
             // into a different piece of the graph.
-            Input::Pane(nvim_ui::Event::Redraw) => self.follow_pane_cursor(),
-            Input::Pane(nvim_ui::Event::Notify(method, _)) if method == editor::WROTE => {
+            Input::Pane(Tab::Editor, nvim_ui::Event::Redraw) => self.follow_pane_cursor(),
+            Input::Pane(Tab::Search, nvim_ui::Event::Redraw) => {}
+            Input::Pane(_, nvim_ui::Event::Notify(method, _)) if method == editor::WROTE => {
                 self.reloading = true;
                 self.trouble = None;
                 let _ = self.reload.send(());
             }
-            Input::Pane(nvim_ui::Event::Notify(..)) => {}
+            Input::Pane(_, nvim_ui::Event::Notify(..)) => {}
             Input::Reloaded(result) => self.reloaded(*result),
-            Input::Pane(nvim_ui::Event::Exited) => {
-                self.editor = None;
+            Input::Pane(Tab::Search, nvim_ui::Event::Exited) => self.pane.drop_search(),
+            Input::Pane(Tab::Editor, nvim_ui::Event::Exited) => {
+                self.pane.close();
                 self.pane_area = Rect::ZERO;
                 self.focus = Focus::Graph;
                 self.trouble = Some("the pane's nvim exited".into());
@@ -1316,10 +1561,7 @@ impl App {
     }
 
     fn widen_pane(&mut self, by: i32) {
-        if let Some(editor) = self.editor.as_mut() {
-            let width = (i32::from(editor.width()) + by).clamp(0, i32::from(u16::MAX));
-            editor.set_width(width as u16);
-        }
+        self.pane.widen(by);
     }
 
     /// Quitting takes the pane's Neovim with it, so it is refused while that
@@ -1376,6 +1618,13 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.camera.bottom(),
             KeyCode::Tab => self.focus_in(),
             KeyCode::BackTab => self.focus_out(),
+            // A slash starts a query, which is why the pane appears before
+            // there is anything to show in it: a box you cannot see is a box
+            // you cannot type into.
+            KeyCode::Char('/') => {
+                self.pane.begin_typing();
+                self.focus = Focus::Pane;
+            }
             KeyCode::Char('n') => self.step_selection(true),
             KeyCode::Char('p') => self.step_selection(false),
             KeyCode::Enter | KeyCode::Char('+') => self.expand(),
@@ -1646,7 +1895,7 @@ where
     terminal.draw(|frame| {
         let area = frame.area();
         app.body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
-        let (graph, pane) = editor::panes(app.body, app.editor.as_ref().map(Editor::width));
+        let (graph, pane) = pane::panes(app.body, app.pane.width());
 
         if graph.width > 0 && graph != app.camera.viewport {
             // Positions persist, so a window that changed size shows more
@@ -1666,19 +1915,30 @@ where
         }
 
         app.pane_area = pane.unwrap_or(Rect::ZERO);
-        if let (Some(editor), Some(pane)) = (app.editor.as_ref(), pane) {
-            // Only on a change: nvim redraws its whole screen for a resize,
-            // and asking every frame would have it doing that forever.
-            if pane != app.pane_was {
-                editor.resize(pane);
+        if let Some(pane) = pane {
+            // The tab bar, and the box on the search tab, sit above whatever
+            // the tab is showing; nvim gets what is left.
+            let body = app.pane.body(pane);
+            if let Some(editor) = app.pane.editor() {
+                // Only on a change: nvim redraws its whole screen for a
+                // resize, and asking every frame would have it doing that
+                // forever.
+                if body != app.pane_was {
+                    editor.resize(body);
+                }
             }
-            editor.draw(frame.buffer_mut(), pane);
-            if app.focus == Focus::Pane {
-                let (x, y) = editor.cursor(pane);
-                frame.set_cursor_position((x, y));
+            app.pane.render(&app.root, pane);
+            app.pane.draw(frame.buffer_mut(), pane);
+            if app.focus == Focus::Pane && app.pane.tab() == pane::Tab::Editor {
+                if let Some(editor) = app.pane.editor() {
+                    let (x, y) = editor.cursor(body);
+                    frame.set_cursor_position((x, y));
+                }
             }
+            app.pane_was = body;
+        } else {
+            app.pane_was = Rect::ZERO;
         }
-        app.pane_was = app.pane_area;
 
         frame.render_widget(
             Paragraph::new(app.status()),
@@ -2598,8 +2858,8 @@ mod tests {
             return;
         }
         let mut app = app_with_pane();
-        let editor = app.editor.as_mut().expect("the pane opened");
-        assert_eq!(editor.width(), 60, "a 120-column body cannot spare eighty");
+        assert_eq!(app.pane.width(), Some(60), "a 120-column body cannot spare eighty");
+        let editor = app.pane.editor_mut().expect("the pane opened");
 
         assert_eq!(editor.natural_width(200), 80, "--clean draws nothing before the code");
         editor.nvim().call("nvim_command", vec!["set number".into()]).expect("nvim answers");
@@ -2659,7 +2919,7 @@ mod tests {
             return;
         }
         let mut app = app_with_pane();
-        let nvim = app.editor.as_ref().expect("the pane opened").nvim();
+        let nvim = app.pane.editor().expect("the pane opened").nvim();
         // Through a call rather than by typing: this has to have landed
         // before the question is asked.
         nvim.call(
@@ -2674,17 +2934,17 @@ mod tests {
         assert!(app.trouble.as_deref().unwrap_or_default().contains("unwritten"));
 
         app.control(Control::Editor);
-        assert!(app.editor.is_some(), "closing threw away an unwritten buffer");
+        assert!(app.pane.is_open(), "closing threw away an unwritten buffer");
 
         // Once it is no longer precious, both go through.
-        app.editor
-            .as_ref()
+        app.pane
+            .editor()
             .expect("still open")
             .nvim()
             .call("nvim_command", vec!["setlocal nomodified".into()])
             .expect("marking it saved");
         app.control(Control::Editor);
-        assert!(app.editor.is_none(), "the pane would not close");
+        assert!(!app.pane.is_open(), "the pane would not close");
         app.leave();
         assert!(app.quit);
     }
@@ -2698,7 +2958,7 @@ mod tests {
         }
         let mut app = app_with_pane();
         {
-            let nvim = app.editor.as_ref().expect("the pane opened").nvim();
+            let nvim = app.pane.editor().expect("the pane opened").nvim();
             nvim.call(
                 "nvim_buf_set_lines",
                 vec![0.into(), 0.into(), (-1).into(), false.into(),
@@ -2796,22 +3056,22 @@ mod tests {
 
         // Diagram to pane: selecting opens the file at what was selected.
         app.select(alpha);
-        let editor = app.editor.as_ref().expect("the pane is open");
+        let editor = app.pane.editor().expect("the pane is open");
         assert_eq!(
             editor.current_file().as_deref().and_then(|p| p.file_name()),
             Some(std::ffi::OsStr::new("lib.rs")),
             "selecting a function did not open its file"
         );
         assert!(
-            settle(|| app.editor.as_ref().is_some_and(|e| {
+            settle(|| app.pane.editor().is_some_and(|e| {
                 e.nvim().viewport().curline == entity_named(&app, "alpha").line_range.start
             })),
             "the pane did not land on alpha"
         );
 
         // Pane to diagram: moving the cursor into the other function picks it.
-        app.editor
-            .as_ref()
+        app.pane
+            .editor()
             .expect("still open")
             .nvim()
             .call(
@@ -2820,7 +3080,7 @@ mod tests {
             )
             .expect("moving the cursor");
         assert!(
-            settle(|| app.editor.as_ref().is_some_and(|e| e.nvim().viewport().curline == beta_line)),
+            settle(|| app.pane.editor().is_some_and(|e| e.nvim().viewport().curline == beta_line)),
             "nvim never reported the new cursor line"
         );
         app.follow_pane_cursor();
@@ -2847,8 +3107,8 @@ mod tests {
 
         // On the `target` of `    target();` -- row 4 counting from one,
         // column 4 counting from zero.
-        app.editor
-            .as_ref()
+        app.pane
+            .editor()
             .expect("the pane is open")
             .nvim()
             .call(
@@ -2863,8 +3123,8 @@ mod tests {
 
         // And off a name, it says so rather than selecting something random.
         app.select(caller);
-        app.editor
-            .as_ref()
+        app.pane
+            .editor()
             .expect("still open")
             .nvim()
             .call(
@@ -2897,7 +3157,7 @@ mod tests {
         // is what nvim's own autocmd does after a `:w`.
         std::fs::write(dir.path().join("lib.rs"), "fn alpha() {}\n\nfn beta() {}\n\nfn gamma() {}\n")
             .expect("writing the file");
-        app.take(Input::Pane(nvim_ui::Event::Notify(editor::WROTE.into(), Vec::new())));
+        app.take(Input::Pane(Tab::Editor, nvim_ui::Event::Notify(editor::WROTE.into(), Vec::new())));
         assert!(app.reloading, "nothing was set off");
 
         let reloaded = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2993,4 +3253,109 @@ mod tests {
             assert!(app.selected.is_some(), "collapsing lost the selection");
         }
     }
+
+    /// A result is a window onto the real file, so the row under its header
+    /// must be the excerpt's first line -- not whatever line nvim happened to
+    /// scroll to. Two results, because a lone window fills the pane and then
+    /// any view at all looks right.
+    #[test]
+    fn a_result_draws_the_lines_the_search_found() {
+        if !have_nvim() {
+            return;
+        }
+        let body: Vec<String> = (0..60)
+            .map(|i| if i == 20 || i == 45 { format!("fn needle{i}() {{ }}") } else { format!("fn f{i}() {{ }}") })
+            .collect();
+        let (dir, graph) = project(&format!("{}\n", body.join("\n")));
+        let (mut app, _queue) = expanded_app(&dir, graph);
+        app.body = Rect::new(0, 0, 160, 40);
+        app.nvim_args = &["--clean"];
+        static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one_at_a_time = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+
+        // `context:2` rather than the default, so the excerpt is several
+        // lines and where the window sits can be seen at all.
+        for c in "needle context:2".chars() {
+            app.pane.edit_query(c);
+        }
+        app.run_search();
+
+        let excerpts = app.pane.results().expect("a search ran").excerpts.clone();
+        assert_eq!(excerpts.len(), 2, "two matches far apart are two results: {excerpts:#?}");
+        assert_eq!(excerpts[0].text.len(), 5, "the query asked for two lines either side");
+        // Line 18 of the file, one above the first excerpt: drawn only if the
+        // window scrolled somewhere the search did not ask for.
+        let above = body[excerpts[0].first_line - 1].clone();
+        let first = excerpts[0].text[0].clone();
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 42)).expect("a terminal");
+        assert!(
+            settle(|| {
+                draw(&mut terminal, &mut app).expect("drawing a frame");
+                let buf = terminal.backend().buffer();
+                let pane = app.pane.body(app.pane_area);
+                let row = |y: u16| -> String {
+                    (pane.x..pane.right()).map(|x| buf[(x, y)].symbol().to_string()).collect()
+                };
+                // Row 0 of the body is the file header nvim draws; the
+                // excerpt starts under it.
+                row(pane.y + 1).contains(first.trim())
+            }),
+            "the first line under the header was not the excerpt's first line"
+        );
+
+        let buf = terminal.backend().buffer();
+        let pane = app.pane.body(app.pane_area);
+        let rows: Vec<String> = (pane.y..pane.bottom())
+            .map(|y| (pane.x..pane.right()).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        assert!(
+            !rows.iter().any(|r| r.contains(above.trim())),
+            "the window showed a line above the excerpt, so its view was not set"
+        );
+        // Vim windows tile the whole pane, so rows one result gives up are
+        // taken by its neighbour unless something else holds them. Without
+        // that, two results in a tall pane make the first one show the rest
+        // of the file.
+        let past = body[excerpts[0].first_line + excerpts[0].text.len() + 4].clone();
+        assert!(
+            !rows.iter().any(|r| r.contains(past.trim())),
+            "a result grew past its own lines to fill the pane"
+        );
+    }
+
+
+    /// A rebuild renumbers every entity, so results from before it name the
+    /// wrong things. The query is asked again against the new tree, which is
+    /// also how an edit shows up in a list that is already on screen -- and
+    /// it happens without taking the keyboard off the diagram.
+    #[test]
+    fn a_rebuild_asks_the_search_again_rather_than_leaving_it_stale() {
+        let (dir, graph) = project("fn needle_one() {}\n");
+        let (mut app, _queue) = expanded_app(&dir, graph);
+        app.body = Rect::new(0, 0, 160, 40);
+        app.nvim_args = &["--clean"];
+
+        for c in "needle".chars() {
+            app.pane.edit_query(c);
+        }
+        app.run_search();
+        assert_eq!(app.pane.results().expect("a search ran").excerpts.len(), 1);
+        app.focus = Focus::Graph;
+
+        // A second match appears on disk, and the tree is re-read.
+        // Far enough apart to stay two results: adjacent matches would be
+        // one merged excerpt, which is right but says less here.
+        std::fs::write(dir.path().join("lib.rs"), "fn needle_one() {}\n\nfn other() {}\n\nfn needle_two() {}\n")
+            .expect("writing the source");
+        let rebuilt = treesitter_producer::graph_from_path(dir.path()).expect("parsing");
+        app.take(Input::Reloaded(Box::new(Ok(rebuilt))));
+
+        let results = app.pane.results().expect("the search is still up");
+        assert_eq!(results.query, "needle");
+        assert_eq!(results.excerpts.len(), 2, "the new match is in the list: {:#?}", results.excerpts);
+        assert_eq!(app.focus, Focus::Graph, "re-running a search must not take the keyboard");
+    }
+
 }

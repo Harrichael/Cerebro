@@ -24,8 +24,6 @@ use nvim_ui::{Mode, Nvim, Value};
 
 /// Neither pane is worth having below these. A body too narrow for both is
 /// given entirely to whichever one the user is looking at.
-const PANE_MIN: u16 = 40;
-const GRAPH_MIN: u16 = 24;
 /// Columns one `ctrl-w <` or `ctrl-w >` moves the divider.
 const RESIZE_STEP: i32 = 4;
 /// Columns of code a pane opens with. Eighty is the width code is written
@@ -53,10 +51,6 @@ pub struct Editor {
     /// The extmark namespace the range tint is drawn in, so showing a new
     /// entity can clear the last one without touching anyone else's marks.
     marks: i64,
-    /// Columns of the body the pane takes, before any clamping. Held as a
-    /// wish rather than a measurement so a window that grows and shrinks
-    /// again comes back to the split the user chose.
-    width: u16,
     /// A `ctrl-w` is waiting for the key that says what it meant.
     pending: bool,
 }
@@ -101,7 +95,7 @@ impl Editor {
                 ],
             );
         }
-        Ok((Editor { nvim, marks, width: area.width, pending: false }, events))
+        Ok((Editor { nvim, marks, pending: false }, events))
     }
 
     /// Put `file` on screen at `line`, with `range` tinted as the extent of
@@ -162,10 +156,6 @@ impl Editor {
         &self.nvim
     }
 
-    pub fn width(&self) -> u16 {
-        self.width
-    }
-
     /// The width the pane would choose for itself: eighty columns of code
     /// plus whatever nvim draws before them -- line numbers, signs, folds --
     /// or `most` when the screen cannot spare that. Asked of nvim rather than
@@ -180,10 +170,6 @@ impl Editor {
             .and_then(|n| u16::try_from(n).ok())
             .unwrap_or(0);
         CODE_COLUMNS.saturating_add(gutter).min(most)
-    }
-
-    pub fn set_width(&mut self, width: u16) {
-        self.width = width;
     }
 
     pub fn resize(&self, area: Rect) {
@@ -283,61 +269,5 @@ impl Editor {
             _ => return,
         };
         self.nvim.mouse(button, action, "", row, col);
-    }
-}
-
-/// How the body is divided. The pane is on the right; `None` means there is
-/// no pane and the diagram has the lot.
-///
-/// A body too narrow for both is not split at all -- two useless columns of
-/// nothing help nobody -- and the pane, being the one you asked for, takes it.
-pub fn panes(body: Rect, pane_width: Option<u16>) -> (Rect, Option<Rect>) {
-    let Some(wanted) = pane_width else {
-        return (body, None);
-    };
-    if body.width < GRAPH_MIN + PANE_MIN {
-        return (Rect { width: 0, ..body }, Some(body));
-    }
-    let pane = wanted.clamp(PANE_MIN, body.width - GRAPH_MIN);
-    let graph = Rect { width: body.width - pane, ..body };
-    (graph, Some(Rect { x: body.x + graph.width, width: pane, ..body }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn body(width: u16) -> Rect {
-        Rect::new(0, 0, width, 20)
-    }
-
-    /// The divider is a wish, not a measurement: it is clamped to what the
-    /// terminal can spare without being forgotten, so widening a window that
-    /// had been squeezed gives back the split the user asked for.
-    #[test]
-    fn the_split_leaves_both_panes_worth_looking_at() {
-        let (graph, pane) = panes(body(100), Some(50));
-        assert_eq!((graph.width, pane.unwrap().width), (50, 50));
-        assert_eq!(pane.unwrap().x, 50, "the pane is on the right");
-
-        let (graph, pane) = panes(body(100), Some(95));
-        assert_eq!(graph.width, GRAPH_MIN, "the diagram keeps a usable strip");
-        assert_eq!(pane.unwrap().width, 100 - GRAPH_MIN);
-
-        let (graph, pane) = panes(body(100), Some(2));
-        assert_eq!(pane.unwrap().width, PANE_MIN, "so does the pane");
-        assert_eq!(graph.width, 100 - PANE_MIN);
-    }
-
-    /// Below the width the two of them need, splitting produces two things
-    /// too narrow to read instead of one that works.
-    #[test]
-    fn a_narrow_terminal_gives_the_whole_body_to_one_of_them() {
-        let (graph, pane) = panes(body(50), Some(25));
-        assert_eq!(pane.unwrap().width, 50, "the pane you opened gets it");
-        assert_eq!(graph.width, 0);
-
-        let (graph, pane) = panes(body(50), None);
-        assert_eq!((graph.width, pane), (50, None), "and with no pane, the diagram does");
     }
 }
