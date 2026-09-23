@@ -25,6 +25,7 @@
 
 mod model;
 pub mod goto;
+pub mod search;
 pub mod test_code;
 
 pub use model::*;

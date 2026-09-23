@@ -3,7 +3,6 @@
 mod dto;
 mod handlers;
 mod reload;
-mod text_index;
 mod watch;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};

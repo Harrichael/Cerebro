@@ -18,7 +18,7 @@ use graph_diff::FileDiff;
 
 use crate::dto::{self, ErrorDto, SourceDto, StatusDto};
 use crate::reload::{self, DiffState, Loaded, Loader, RemapHistory, Snapshot};
-use crate::text_index::{Limits, TextIndex};
+use entity_graph::search::{Limits, TextIndex};
 
 pub struct Response {
     pub status: u16,
@@ -94,7 +94,7 @@ const VENDOR: &[(&str, &str)] = &[
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// `/search` result caps, one per kind.
-const SEARCH_LIMITS: Limits = Limits { file: 30, path: 30, content: 100 };
+const SEARCH_LIMITS: Limits = Limits { file: 30, path: 30, content: 100, symbol: 30 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -815,8 +815,10 @@ mod tests {
         ]);
         let s = server_at(fixture_loader(), root);
 
-        // Unrestricted "main": the file hit for main.rs leads, with offsets
-        // matching the contract example exactly; its path hit is suppressed
+        // Unrestricted "main": the symbol hit leads -- a thing called `main`
+        // beats a file whose name contains it -- then the file hit for
+        // main.rs, with offsets matching the contract example exactly. The
+        // path hit is suppressed
         // (the match sits in the filename tail, the same occurrence the file
         // hit already shows); content hits are ordered by path then line and
         // truncated to the limit.
@@ -825,6 +827,10 @@ mod tests {
         let hits = main["hits"].as_array().unwrap();
         assert_eq!(
             hits[0],
+            json!({ "kind": "symbol", "id": 2, "path": "src/main.rs", "line": 2, "text": "main", "start": 0, "end": 4 })
+        );
+        assert_eq!(
+            hits[1],
             json!({ "kind": "file", "id": 2, "path": "src/main.rs", "text": "main.rs", "start": 0, "end": 4 })
         );
         assert!(hits.iter().all(|h| h["kind"] != "path"), "main.rs's path hit must be suppressed: {hits:?}");
@@ -832,7 +838,7 @@ mod tests {
         assert_eq!(content.len(), 100);
         assert_eq!((content[0]["path"].as_str(), content[0]["line"].as_i64()), (Some("src/lib.rs"), Some(0)));
         assert_eq!((content[1]["path"].as_str(), content[1]["line"].as_i64()), (Some("src/main.rs"), Some(0)));
-        assert_eq!(main["more"], json!({ "file": 0, "path": 0, "content": 4 }));
+        assert_eq!(main["more"], json!({ "file": 0, "path": 0, "content": 4, "symbol": 0 }));
 
         // A match confined to a directory segment ("src") is a different
         // occurrence from any filename tail and is kept, unlike above.
@@ -889,7 +895,7 @@ mod tests {
         assert_eq!(s.respond("GET", "/search").status, 400);
         assert_eq!(s.respond("POST", "/search?q=main").status, 405);
         assert_eq!(json(&s.respond("GET", "/search?q=")), json!({
-            "generation": 1, "query": "", "hits": [], "more": { "file": 0, "path": 0, "content": 0 }
+            "generation": 1, "query": "", "hits": [], "more": { "file": 0, "path": 0, "content": 0, "symbol": 0 }
         }));
     }
 

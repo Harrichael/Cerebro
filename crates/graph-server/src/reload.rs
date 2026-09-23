@@ -16,7 +16,7 @@ use graph_diff::{FileDiff, GraphDiff, Status};
 
 use crate::dto::{self, DiffView, RemapDto};
 use crate::handlers::build_text_index;
-use crate::text_index::TextIndex;
+use entity_graph::search::TextIndex;
 
 /// What a load produced. `Diff` is what `graph_diff::diff` returns plus the
 /// labels the payloads show for the base side.

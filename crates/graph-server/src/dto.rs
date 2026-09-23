@@ -10,7 +10,7 @@ use entity_graph::{Entity, EntityGraph, EntityKind, Reference, ReferenceKind};
 use graph_diff::{LineOp, Status, Tag};
 use serde::Serialize;
 
-use crate::text_index::SearchResult;
+use entity_graph::search::SearchResult;
 
 #[derive(Serialize)]
 pub struct GraphDto {
@@ -135,6 +135,7 @@ pub struct MoreDto {
     pub file: usize,
     pub path: usize,
     pub content: usize,
+    pub symbol: usize,
 }
 
 /// `error` is always present (`null` when the last rebuild succeeded) so the
@@ -148,6 +149,13 @@ pub struct StatusDto {
     pub error: Option<String>,
 }
 
+/// The wire slices JS strings, which count UTF-16 code units; the engine
+/// counts chars. `text` is the string the offsets are measured against.
+fn utf16_span(text: &str, start_chars: usize, end_chars: usize) -> (usize, usize) {
+    let upto = |n: usize| text.chars().take(n).map(char::len_utf16).sum();
+    (upto(start_chars), upto(end_chars))
+}
+
 pub fn search_dto(r: &SearchResult, generation: u64) -> SearchDto {
     SearchDto {
         generation,
@@ -155,17 +163,25 @@ pub fn search_dto(r: &SearchResult, generation: u64) -> SearchDto {
         hits: r
             .hits
             .iter()
-            .map(|h| HitDto {
-                kind: h.kind.as_str(),
-                id: h.file.0,
-                path: h.path.clone(),
-                line: h.line,
-                text: h.text.clone(),
-                start: h.start,
-                end: h.end,
+            .map(|h| {
+                let (start, end) = utf16_span(&h.text, h.start, h.end);
+                HitDto {
+                    kind: h.kind.as_str(),
+                    id: h.file.0,
+                    path: h.path.clone(),
+                    line: h.line,
+                    text: h.text.clone(),
+                    start,
+                    end,
+                }
             })
             .collect(),
-        more: MoreDto { file: r.more.file, path: r.more.path, content: r.more.content },
+        more: MoreDto {
+            file: r.more.file,
+            path: r.more.path,
+            content: r.more.content,
+            symbol: r.more.symbol,
+        },
     }
 }
 
@@ -425,4 +441,14 @@ mod tests {
         assert_eq!(counts("gone.rs"), (3, 3), "a removed file keeps its old size");
         assert_eq!(counts("old"), (10, 0), "so does a removed folder");
     }
+
+    /// The engine counts chars; this wire counts UTF-16 code units, because
+    /// the page slices JS strings with them. An astral char is where the two
+    /// part company: one char, two units.
+    #[test]
+    fn a_hit_reaches_the_page_in_the_units_it_slices_with() {
+        assert_eq!(utf16_span("😀 Foo", 2, 5), (3, 6));
+        assert_eq!(utf16_span("plain", 0, 2), (0, 2));
+    }
+
 }

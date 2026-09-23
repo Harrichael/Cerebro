@@ -175,8 +175,13 @@ generation differs from the client's graph must not be joined against it.
   "more": { "file": 0, "path": 0, "content": 12 } }
 ```
 Substring search, case-insensitive, over three kinds built per generation
-from every File entity in the graph: `file` (the entity's name), `path` (its wire
-path, `/`-separated), `content` (its lines, one document per line). Only
+from the graph: `file` (a File entity's name), `path` (its wire path,
+`/`-separated), `content` (its lines, one document per line), and `symbol`
+(the name of every entity that is not a File or a Folder -- a class, a
+function, a module). A `symbol` hit carries the `line` its entity was
+declared on and the file that holds it, so it answers with a definition
+rather than with a line that mentions the same word; symbol hits lead the
+list for that reason. Only
 files the server can read text for are indexed — same texts `/source` would
 serve, so a file that fails to read (unreadable, non-UTF-8, too big, or, in
 diff mode, absent from both sides) is simply not searchable; a removed file
@@ -189,9 +194,15 @@ is indexed from its old text, an edited file from its new text.
 - **Terms.** The query is split on whitespace into terms that must *all*
   hold. Double quotes join a phrase into one term and are removed
   (`"fn respond"`). A term may carry a tag, `file:`, `path:` or `content:`
-  (case-insensitive, written outside any quotes); anything else with a colon
+  `symbol:` (case-insensitive, written outside any quotes); anything else with a colon
   (`foo:bar`, `C:\x`) is a plain term, and `"file:x"` in quotes is too. A tag
   with nothing after it is ignored.
+- **`context:N`** is a directive rather than a term: it narrows nothing, and
+  says how many lines either side of a content match to show. This endpoint
+  has no use for it and ignores it — it is here because the terminal viewer
+  shares this grammar, and because it means `q=context:2` no longer searches
+  for that text. `context:` with a payload that is not a number stays an
+  ordinary term; the last one written wins.
 - **How a term holds.** For a hit of kind K, a bare term or a term tagged K
   must occur in the hit's own text (the name, the path, or the line). A term
   tagged with another kind is a filter on the hit's file: `file:` on its

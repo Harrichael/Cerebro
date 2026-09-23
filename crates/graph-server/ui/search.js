@@ -2,9 +2,9 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { html, fetchJson } from './common.js';
 
 const DEBOUNCE_MS = 120;
-const GROUP_LABEL = { file: 'Files', path: 'Paths', content: 'Lines' };
-const MORE_LABEL = { file: 'files', path: 'paths', content: 'lines' };
-const KIND_ORDER = ['file', 'path', 'content'];
+const GROUP_LABEL = { symbol: 'Symbols', file: 'Files', path: 'Paths', content: 'Lines' };
+const MORE_LABEL = { symbol: 'symbols', file: 'files', path: 'paths', content: 'lines' };
+const KIND_ORDER = ['symbol', 'file', 'path', 'content'];
 
 // Hidden ids and the test filter are client-only state the server has no
 // notion of; apply them to each hit's file id the same way the diagram does.
